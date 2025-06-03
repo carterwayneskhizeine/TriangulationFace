@@ -84,9 +84,13 @@ class FaceLandmarkerCamera:
         self.enable_perspective_projection = True  # 是否使用透视投影
         
         # 【新增】透视效果调节参数
-        self.perspective_base_depth = 25.0  # 基础深度（厘米）
-        self.perspective_depth_variation = 25.0  # 深度变化范围（厘米）
-        self.perspective_intensity = 1.0  # 透视强度系数（1.0=35mm, 0.7=50mm, 0.4=85mm, 1.5=24mm超广角）
+        self.perspective_base_depth = 8.0  # 基础深度（厘米）
+        self.perspective_depth_variation = 20.0  # 深度变化范围（厘米）
+        self.perspective_intensity = 1.75  # 透视强度系数（1.0=35mm, 0.7=50mm, 0.4=85mm, 1.5=24mm超广角）
+        
+        # 【新增】面部整体平移控制
+        self.face_offset_x = 0.0  # 面部X方向偏移（归一化坐标，-1.0到1.0）
+        self.face_offset_y = 0.0  # 面部Y方向偏移（归一化坐标，-1.0到1.0）
         
         # 显示控制
         self.show_landmarks = True  # 控制是否显示landmarks点和连线
@@ -160,6 +164,7 @@ class FaceLandmarkerCamera:
         print("按 '1/2' 键调整透视强度 (模拟不同焦距)")
         print("按 '5/6' 键调整基础深度")
         print("按 '7/8' 键调整深度变化范围")
+        print("按 'A/D' 键左右移动面部，'Z/C' 键上下移动面部")
         print("按 'ESC' 键或 'Q' 键退出程序")
         print(f"相机校准: {'使用真实校准' if self.use_real_calibration else '使用手动估计'}")
 
@@ -396,12 +401,17 @@ class FaceLandmarkerCamera:
                 # 【增强】透视投影公式：通过调整深度来改变投影位置
                 # 原理：更远的点会向画面中心收缩，更近的点会向边缘扩张
                 
-                # 计算相对于画面中心的偏移
-                center_x = self.camera_width / 2.0
-                center_y = self.camera_height / 2.0
+                # 【关键修改】计算face landmarks的中心点作为透视中心
+                face_center_x_norm = np.mean(dst_landmarks[:, 0])  # 归一化坐标
+                face_center_y_norm = np.mean(dst_landmarks[:, 1])
                 
-                offset_x = x_pixel - center_x
-                offset_y = y_pixel - center_y
+                # 转换为像素坐标
+                face_center_x_pixel = face_center_x_norm * self.camera_width
+                face_center_y_pixel = face_center_y_norm * self.camera_height
+                
+                # 计算相对于face landmarks中心的偏移（而不是画面中心）
+                offset_x = x_pixel - face_center_x_pixel
+                offset_y = y_pixel - face_center_y_pixel
                 
                 # 增强的透视缩放因子
                 # 使用非线性函数增强透视效果
@@ -416,8 +426,8 @@ class FaceLandmarkerCamera:
                     enhanced_scale *= (1.0 + z_norm * 2.0)  # 最多增强20%
                 
                 # 应用透视缩放
-                new_x_pixel = center_x + offset_x * enhanced_scale
-                new_y_pixel = center_y + offset_y * enhanced_scale
+                new_x_pixel = face_center_x_pixel + offset_x * enhanced_scale
+                new_y_pixel = face_center_y_pixel + offset_y * enhanced_scale
                 
                 # 转换回归一化坐标
                 perspective_dst[i] = [
@@ -482,6 +492,11 @@ class FaceLandmarkerCamera:
             if self.enable_perspective_projection:
                 warped_coords = self.apply_perspective_warp_to_landmarks(original_coords, warped_coords)
                 print(f"透视投影已应用，强度: {self.perspective_intensity:.1f}, 深度: {self.perspective_base_depth:.0f}±{self.perspective_depth_variation:.0f}cm")
+            
+            # 【新增】应用面部整体平移
+            if self.face_offset_x != 0.0 or self.face_offset_y != 0.0:
+                warped_coords[:, 0] += self.face_offset_x  # X方向平移
+                warped_coords[:, 1] += self.face_offset_y  # Y方向平移
             
             # 应用人脸变形
             warped_image = self.face_warper.apply_face_warp(
@@ -638,6 +653,15 @@ class FaceLandmarkerCamera:
         else:
             image = self.put_chinese_text(image, '透视投影已关闭 (弱透视模式)', 
                                         (10, height - 175), font_size=18, color=(128, 128, 128))
+        
+        # 显示面部偏移状态
+        if self.face_offset_x != 0.0 or self.face_offset_y != 0.0:
+            offset_text = f'面部偏移: X={self.face_offset_x:.2f}, Y={self.face_offset_y:.2f} (A/D/Z/C调节)'
+            image = self.put_chinese_text(image, offset_text, 
+                                        (10, height - 195), font_size=18, color=(255, 255, 128))
+        else:
+            image = self.put_chinese_text(image, '面部偏移: 居中 (A/D/Z/C调节)', 
+                                        (10, height - 195), font_size=18, color=(128, 128, 128))
         
         # 显示landmarks缩放状态
         if self.warp_ready and self.show_warped:
@@ -830,6 +854,7 @@ class FaceLandmarkerCamera:
         print("  '1/2' 键调整透视强度 (模拟不同焦距)")
         print("  '5/6' 键调整基础深度")
         print("  '7/8' 键调整深度变化范围")
+        print("  'A/D' 键左右移动面部，'Z/C' 键上下移动面部")
         print("  'ESC' 键或 'Q' 键退出程序")
         
         try:
@@ -1010,6 +1035,18 @@ class FaceLandmarkerCamera:
                 elif key == ord('8'):  # '8' 键增大深度变化范围
                     self.perspective_depth_variation = min(50.0, self.perspective_depth_variation + 5.0)
                     print(f"深度变化: {self.perspective_depth_variation:.1f}cm (变化越大立体感越强)")
+                elif key == ord('A') or key == ord('a'):  # 'A' 或 'a' 键左右移动面部
+                    self.face_offset_x = max(-1.0, self.face_offset_x - 0.05)
+                    print(f"面部X方向偏移调整为: {self.face_offset_x:.2f}")
+                elif key == ord('D') or key == ord('d'):  # 'D' 或 'd' 键左右移动面部
+                    self.face_offset_x = min(1.0, self.face_offset_x + 0.05)
+                    print(f"面部X方向偏移调整为: {self.face_offset_x:.2f}")
+                elif key == ord('Z') or key == ord('z'):  # 'Z' 或 'z' 键上下移动面部
+                    self.face_offset_y = max(-1.0, self.face_offset_y - 0.05)
+                    print(f"面部Y方向偏移调整为: {self.face_offset_y:.2f}")
+                elif key == ord('C') or key == ord('c'):  # 'C' 或 'c' 键上下移动面部
+                    self.face_offset_y = min(1.0, self.face_offset_y + 0.05)
+                    print(f"面部Y方向偏移调整为: {self.face_offset_y:.2f}")
                 
         except KeyboardInterrupt:
             print("\n程序被用户中断")
