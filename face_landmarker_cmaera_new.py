@@ -82,9 +82,11 @@ class FaceLandmarkerCamera:
         self.previous_landmarks = None  # 用于平滑处理
         # 透视投影控制
         self.enable_perspective_projection = True  # 是否使用透视投影
-        # 新的透视投影参数
-        self.perspective_strength = 0.2  # 透视强度 (0.0-1.0)
-        self.depth_enhancement = 3.0    # 深度增强系数 (1.0-20.0)
+        
+        # 【新增】透视效果调节参数
+        self.perspective_base_depth = 25.0  # 基础深度（厘米）
+        self.perspective_depth_variation = 25.0  # 深度变化范围（厘米）
+        self.perspective_intensity = 1.0  # 透视强度系数（1.0=35mm, 0.7=50mm, 0.4=85mm, 1.5=24mm超广角）
         
         # 显示控制
         self.show_landmarks = True  # 控制是否显示landmarks点和连线
@@ -155,8 +157,9 @@ class FaceLandmarkerCamera:
         print("按 'O' 键切换面部专用模式 (只显示面部，背景纯黑)")
         print("按 'R' 键开始/停止录制输出视频")
         print("按 'T' 键切换透视投影/弱透视投影")
-        print("按 '5' 键减小透视强度，'6' 键增大透视强度")
-        print("按 '7' 键减小深度增强，'8' 键增大深度增强")
+        print("按 '1/2' 键调整透视强度 (模拟不同焦距)")
+        print("按 '5/6' 键调整基础深度")
+        print("按 '7/8' 键调整深度变化范围")
         print("按 'ESC' 键或 'Q' 键退出程序")
         print(f"相机校准: {'使用真实校准' if self.use_real_calibration else '使用手动估计'}")
 
@@ -342,46 +345,9 @@ class FaceLandmarkerCamera:
             traceback.print_exc()
             return rgb_image  # 返回原始图像
     
-    def convert_to_perspective_landmarks(self, landmarks_normalized):
-        """
-        将MediaPipe的弱透视投影landmarks转换为透视投影landmarks
-        
-        Args:
-            landmarks_normalized: 归一化的landmarks坐标 (N, 3)
-        
-        Returns:
-            perspective_landmarks: 透视投影的landmarks坐标 (N, 3)
-        """
-        try:
-            perspective_landmarks = landmarks_normalized.copy()
-            height, width = self.camera_height, self.camera_width
-            
-            for i, (x_norm, y_norm, z_weak) in enumerate(landmarks_normalized):
-                # 转换为像素坐标
-                x_pixel = x_norm * width
-                y_pixel = y_norm * height
-                
-                # 计算透视深度
-                # z_weak是弱透视的Z值，我们需要将其转换为真实深度
-                z_perspective = self.perspective_strength * z_weak + (1 - self.perspective_strength) * self.depth_enhancement
-                
-                # 透视投影逆变换：从2D像素坐标和深度得到3D坐标
-                x_3d = (x_pixel - self.camera_cx) * z_perspective / self.camera_fx
-                y_3d = (y_pixel - self.camera_cy) * z_perspective / self.camera_fy
-                
-                # 重新投影到归一化坐标，但保持透视效果
-                # 这里我们保持X,Y的相对关系，但调整Z以反映真实深度
-                perspective_landmarks[i] = [x_norm, y_norm, z_perspective / self.depth_enhancement]
-            
-            return perspective_landmarks
-            
-        except Exception as e:
-            print(f"透视投影转换失败: {e}")
-            return landmarks_normalized
-    
     def apply_perspective_warp_to_landmarks(self, src_landmarks, dst_landmarks):
         """
-        对landmarks应用透视投影变形
+        对landmarks应用标准透视投影变形（使用真实相机参数）
         
         Args:
             src_landmarks: 源landmarks (N, 3)
@@ -396,7 +362,6 @@ class FaceLandmarkerCamera:
             
             perspective_dst = dst_landmarks.copy()
             
-            # 【重新设计】使用真正的透视投影公式，基于真实相机参数
             # 使用真实的相机参数或回退到估计参数
             if self.camera_fx is not None and self.camera_fy is not None:
                 # 使用真实校准的相机参数
@@ -404,25 +369,19 @@ class FaceLandmarkerCamera:
                 focal_length_y = self.camera_fy
                 principal_point_x = self.camera_cx
                 principal_point_y = self.camera_cy
-                print_debug = False  # 避免过多输出，只在第一帧显示
             else:
                 # 回退到手动估计
                 focal_length_x = min(self.camera_width, self.camera_height) * 0.8
                 focal_length_y = focal_length_x
                 principal_point_x = self.camera_width / 2.0
                 principal_point_y = self.camera_height / 2.0
-                print_debug = False
             
-            # 3D投影参数
-            base_depth = 50.0  # 基础深度（厘米）
-            depth_variation = 5.0  # 深度变化范围（厘米）
+            # 【修改】使用可调节的透视参数
+            base_depth = self.perspective_base_depth  # 基础深度（厘米）
+            depth_variation = self.perspective_depth_variation  # 深度变化范围（厘米）
+            perspective_intensity = self.perspective_intensity  # 透视强度系数
             
-            if print_debug:
-                print(f"透视投影参数:")
-                print(f"  fx: {focal_length_x:.2f}, fy: {focal_length_y:.2f}")
-                print(f"  cx: {principal_point_x:.2f}, cy: {principal_point_y:.2f}")
-             
-            # 对每个landmark应用透视变换
+            # 对每个landmark应用标准透视变换
             for i in range(len(dst_landmarks)):
                 x_norm, y_norm, z_norm = dst_landmarks[i]
                 
@@ -430,21 +389,35 @@ class FaceLandmarkerCamera:
                 x_pixel = x_norm * self.camera_width
                 y_pixel = y_norm * self.camera_height
                 
-                # 【新算法】计算3D坐标
-                # Z值：负值表示离相机近，正值表示离相机远
-                z_3d = base_depth + (z_norm * depth_variation)
+                # 计算实际深度（使用MediaPipe的Z值增强深度感）
+                # MediaPipe的z_norm通常在-0.1到0.1之间
+                actual_depth = base_depth + (z_norm * depth_variation)
                 
-                # 将像素坐标转换为相机坐标系（使用真实的主点位置）
-                x_3d = (x_pixel - principal_point_x) * z_3d / focal_length_x
-                y_3d = (y_pixel - principal_point_y) * z_3d / focal_length_y
+                # 【增强】透视投影公式：通过调整深度来改变投影位置
+                # 原理：更远的点会向画面中心收缩，更近的点会向边缘扩张
                 
-                # 【关键】应用透视投影：P' = f * P / Z
-                # 这里我们通过调整Z来产生透视效果
-                perspective_z = z_3d * (1.0 + z_norm * self.perspective_strength * self.depth_enhancement)  # 根据原始Z值调整透视深度
+                # 计算相对于画面中心的偏移
+                center_x = self.camera_width / 2.0
+                center_y = self.camera_height / 2.0
                 
-                # 重新投影到2D（使用对应的焦距）
-                new_x_pixel = (x_3d * focal_length_x / perspective_z) + principal_point_x
-                new_y_pixel = (y_3d * focal_length_y / perspective_z) + principal_point_y
+                offset_x = x_pixel - center_x
+                offset_y = y_pixel - center_y
+                
+                # 增强的透视缩放因子
+                # 使用非线性函数增强透视效果
+                depth_ratio = base_depth / actual_depth
+                
+                # 应用透视强度系数，增强近大远小的效果
+                enhanced_scale = 1.0 + (depth_ratio - 1.0) * perspective_intensity
+                
+                # 对于更接近的点（z_norm > 0），进一步放大偏移
+                if z_norm > 0:
+                    # 鼻尖等凸出部分，增强放大效果
+                    enhanced_scale *= (1.0 + z_norm * 2.0)  # 最多增强20%
+                
+                # 应用透视缩放
+                new_x_pixel = center_x + offset_x * enhanced_scale
+                new_y_pixel = center_y + offset_y * enhanced_scale
                 
                 # 转换回归一化坐标
                 perspective_dst[i] = [
@@ -505,10 +478,10 @@ class FaceLandmarkerCamera:
                 # 以人脸中心X坐标为基准，只调整X坐标
                 warped_coords[:, 0] = face_center_x + (warped_coords[:, 0] - face_center_x) * self.width_scale
             
-            # 【关键】如果启用透视投影，对变形后的landmarks应用透视变换
+            # 应用透视投影变形
             if self.enable_perspective_projection:
                 warped_coords = self.apply_perspective_warp_to_landmarks(original_coords, warped_coords)
-                print(f"透视投影已应用，深度距离: {self.perspective_strength:.2f}, 深度增强: {self.depth_enhancement:.1f}")
+                print(f"透视投影已应用，强度: {self.perspective_intensity:.1f}, 深度: {self.perspective_base_depth:.0f}±{self.perspective_depth_variation:.0f}cm")
             
             # 应用人脸变形
             warped_image = self.face_warper.apply_face_warp(
@@ -658,7 +631,8 @@ class FaceLandmarkerCamera:
         
         # 显示透视投影状态
         if self.enable_perspective_projection:
-            perspective_text = f'透视投影已启用 (深度:{self.perspective_strength:.2f}, 增强:{self.depth_enhancement:.1f})'
+            focal_length_equiv = int(35 / self.perspective_intensity) if self.perspective_intensity > 0 else 350
+            perspective_text = f'透视投影: 等效{focal_length_equiv}mm 深度{self.perspective_base_depth:.0f}±{self.perspective_depth_variation:.0f}cm'
             image = self.put_chinese_text(image, perspective_text, 
                                         (10, height - 175), font_size=18, color=(255, 128, 255))
         else:
@@ -853,8 +827,9 @@ class FaceLandmarkerCamera:
         print("  'O' 键切换面部专用模式 (只显示面部，背景纯黑)")
         print("  'R' - 开始/停止录制输出视频")
         print("  'T' 键切换透视投影/弱透视投影")
-        print("  '5' 键减小透视强度，'6' 键增大透视强度")
-        print("  '7' 键减小深度增强，'8' 键增大深度增强")
+        print("  '1/2' 键调整透视强度 (模拟不同焦距)")
+        print("  '5/6' 键调整基础深度")
+        print("  '7/8' 键调整深度变化范围")
         print("  'ESC' 键或 'Q' 键退出程序")
         
         try:
@@ -997,18 +972,6 @@ class FaceLandmarkerCamera:
                 elif key == ord('O') or key == ord('o'):  # 'O' 或 'o' 键切换面部专用模式
                     self.enable_face_only_mode = not self.enable_face_only_mode
                     print(f"面部专用模式已切换为: {'只显示面部，背景纯黑' if self.enable_face_only_mode else '显示完整人脸'}")
-                elif key == ord('-') or key == ord('_'):  # '-' 键减细线框
-                    if self.enable_pixel_warp and self.enable_lambert_material:
-                        self.wireframe_thickness = max(0.1, self.wireframe_thickness - 0.1)
-                        print(f"线框粗细调整为: {self.wireframe_thickness:.1f}")
-                    else:
-                        print("线框粗细调节功能仅在Lambert材质模式下可用")
-                elif key == ord('+') or key == ord('='):  # '+' 键增粗线框
-                    if self.enable_pixel_warp and self.enable_lambert_material:
-                        self.wireframe_thickness = min(2.0, self.wireframe_thickness + 0.1)
-                        print(f"线框粗细调整为: {self.wireframe_thickness:.1f}")
-                    else:
-                        print("线框粗细调节功能仅在Lambert材质模式下可用")
                 elif key == ord('R') or key == ord('r'):  # 'R' 或 'r' 键切换录制
                     if not self.save_output_video:
                         # 开始录制
@@ -1027,18 +990,26 @@ class FaceLandmarkerCamera:
                     else:
                         self.enable_perspective_projection = True
                         print("切换到透视投影")
-                elif key == ord('5'):  # '5' 键减小透视强度
-                    self.perspective_strength = max(0.0, self.perspective_strength - 0.1)
-                    print(f"透视强度调整为: {self.perspective_strength:.2f}")
-                elif key == ord('6'):  # '6' 键增大透视强度
-                    self.perspective_strength = min(1.0, self.perspective_strength + 0.1)
-                    print(f"透视强度调整为: {self.perspective_strength:.2f}")
-                elif key == ord('7'):  # '7' 键减小深度增强
-                    self.depth_enhancement = max(1.0, self.depth_enhancement - 1.0)
-                    print(f"深度增强调整为: {self.depth_enhancement:.1f}")
-                elif key == ord('8'):  # '8' 键增大深度增强
-                    self.depth_enhancement = min(20.0, self.depth_enhancement + 1.0)
-                    print(f"深度增强调整为: {self.depth_enhancement:.1f}")
+                elif key == ord('1'):  # '1' 键减小透视强度（模拟长焦镜头）
+                    self.perspective_intensity = max(0.1, self.perspective_intensity - 0.1)
+                    focal_length_equiv = int(35 / self.perspective_intensity) if self.perspective_intensity > 0 else 350
+                    print(f"透视强度: {self.perspective_intensity:.1f} (约等效{focal_length_equiv}mm焦距)")
+                elif key == ord('2'):  # '2' 键增大透视强度（模拟广角镜头）
+                    self.perspective_intensity = min(2.0, self.perspective_intensity + 0.1)
+                    focal_length_equiv = int(35 / self.perspective_intensity)
+                    print(f"透视强度: {self.perspective_intensity:.1f} (约等效{focal_length_equiv}mm焦距)")
+                elif key == ord('5'):  # '5' 键减小基础深度（更近距离拍摄效果）
+                    self.perspective_base_depth = max(10.0, self.perspective_base_depth - 5.0)
+                    print(f"基础深度: {self.perspective_base_depth:.1f}cm (距离越近透视越强)")
+                elif key == ord('6'):  # '6' 键增大基础深度（更远距离拍摄效果）
+                    self.perspective_base_depth = min(100.0, self.perspective_base_depth + 5.0)
+                    print(f"基础深度: {self.perspective_base_depth:.1f}cm (距离越远透视越弱)")
+                elif key == ord('7'):  # '7' 键减小深度变化范围
+                    self.perspective_depth_variation = max(5.0, self.perspective_depth_variation - 5.0)
+                    print(f"深度变化: {self.perspective_depth_variation:.1f}cm (变化越小面部越平)")
+                elif key == ord('8'):  # '8' 键增大深度变化范围
+                    self.perspective_depth_variation = min(50.0, self.perspective_depth_variation + 5.0)
+                    print(f"深度变化: {self.perspective_depth_variation:.1f}cm (变化越大立体感越强)")
                 
         except KeyboardInterrupt:
             print("\n程序被用户中断")
