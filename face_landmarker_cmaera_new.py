@@ -66,8 +66,8 @@ class FaceLandmarkerCamera:
         self.load_saved_transform()
         
         # 摄像头分辨率参数（将在run方法中根据实际摄像头分辨率更新）
-        self.camera_width = 640   # 默认摄像头分辨率
-        self.camera_height = 480  # 默认摄像头分辨率
+        self.camera_width = 1280   # 默认摄像头分辨率
+        self.camera_height = 720  # 默认摄像头分辨率
         self.aspect_ratio = self.camera_width / self.camera_height
         self.x_scale_factor = self.aspect_ratio / 1.0  # 用于修正x坐标的拉伸，会根据实际摄像头更新
         
@@ -84,13 +84,17 @@ class FaceLandmarkerCamera:
         self.enable_perspective_projection = True  # 是否使用透视投影
         
         # 【新增】透视效果调节参数
-        self.perspective_base_depth = 8.0  # 基础深度（厘米）
-        self.perspective_depth_variation = 22.0  # 深度变化范围（厘米）
-        self.perspective_intensity = 1.75  # 透视强度系数（1.0=35mm, 0.7=50mm, 0.4=85mm, 1.5=24mm超广角）
+        self.perspective_base_depth = 50.0  # 基础深度（厘米）- 调整为25cm，模拟近距离拍摄
+        self.perspective_depth_variation = 50.0  # 深度变化范围（厘米）- 减小到30cm
+        self.perspective_intensity = -0.65  # 透视强度系数（增强到2.5，模拟强烈的广角效果）
         
         # 【新增】上下透视增强参数
-        self.vertical_perspective_strength = -0.2  # 上下透视强度（0.0-2.0）
+        self.vertical_perspective_strength = 0.0  # 上下透视强度（增加到0.3）
         self.vertical_perspective_center = 0.5  # 上下透视中心位置（0.0=顶部, 1.0=底部, 0.4=眼部位置）
+        
+        # 【新增】左右透视增强参数
+        self.horizontal_perspective_strength = 1.0  # 左右透视强度（调整到0.5）
+        self.horizontal_perspective_center = 0.5  # 左右透视中心位置（0.0=左侧, 1.0=右侧, 0.5=中心）
         
         # 【新增】面部整体平移控制
         self.face_offset_x = 0.0  # 面部X方向偏移（归一化坐标，-1.0到1.0）
@@ -169,6 +173,7 @@ class FaceLandmarkerCamera:
         print("按 '5/6' 键调整基础深度")
         print("按 '7/8' 键调整深度变化范围")
         print("按 '9/0' 键调整上下透视强度")
+        print("按 '/*' 键调整左右透视强度")
         print("按 'A/D' 键左右移动面部，'Z/C' 键上下移动面部")
         print("按 'ESC' 键或 'Q' 键退出程序")
         print(f"相机校准: {'使用真实校准' if self.use_real_calibration else '使用手动估计'}")
@@ -401,7 +406,7 @@ class FaceLandmarkerCamera:
                 
                 # 计算实际深度（使用MediaPipe的Z值增强深度感）
                 # MediaPipe的z_norm通常在-0.1到0.1之间
-                actual_depth = base_depth + (z_norm * depth_variation)
+                actual_depth = base_depth + (z_norm * depth_variation * 2)
                 
                 # 【增强】透视投影公式：通过调整深度来改变投影位置
                 # 原理：更远的点会向画面中心收缩，更近的点会向边缘扩张
@@ -422,29 +427,44 @@ class FaceLandmarkerCamera:
                 # 使用非线性函数增强透视效果
                 depth_ratio = base_depth / actual_depth
                 
-                # 应用透视强度系数，增强近大远小的效果
-                enhanced_scale = 1.0 + (depth_ratio - 1.0) * perspective_intensity
-                
-                # 对于更接近的点（z_norm > 0），进一步放大偏移
+                # 【关键修复】应用透视强度系数，实现真正的近大远小效果
+                # 修正透视方向：近的点（z_norm > 0）应该放大，远的点（z_norm < 0）应该缩小
                 if z_norm > 0:
-                    # 鼻尖等凸出部分，增强放大效果
-                    enhanced_scale *= (1.0 + z_norm * 2.0)  # 最多增强20%
+                    # 凸出部分（鼻尖等）：距离更近，应该放大
+                    perspective_scale = 1.0 + (z_norm * perspective_intensity * 3.0)  # 增强近距离放大
+                else:
+                    # 凹陷部分（眼窝、太阳穴等）：距离更远，应该缩小
+                    perspective_scale = 1.0 + (z_norm * perspective_intensity * 2.0)  # 远距离缩小
                 
-                # 【新增】基于Y坐标的上下透视增强
-                # 模拟广角镜头的上下透视变形效果
+                # 【新增】基于距离中心的径向畸变（模拟广角镜头的桶形畸变）
+                # 计算点到面部中心的距离
+                center_offset_x = x_norm - face_center_x_norm
+                center_offset_y = y_norm - face_center_y_norm
+                distance_from_center = np.sqrt(center_offset_x**2 + center_offset_y**2)
+                
+                # 广角镜头的径向畸变：距离中心越远，畸变越强
+                radial_distortion = 1.0 + (distance_from_center * perspective_intensity * 0.5)
+                
+                # 组合透视缩放和径向畸变
+                enhanced_scale = perspective_scale * radial_distortion
+                
+                # 【可选】添加方向性增强（模拟不同方向的透视强度）
+                # X方向增强
+                x_relative = x_norm  # 归一化X坐标 (0.0=左侧, 1.0=右侧)
+                x_distance_from_center = abs(x_relative - self.horizontal_perspective_center)
+                horizontal_enhancement = 1.0 + (x_distance_from_center * self.horizontal_perspective_strength)
+                
+                # Y方向增强
                 y_relative = y_norm  # 归一化Y坐标 (0.0=顶部, 1.0=底部)
-                
-                # 计算相对于透视中心的Y方向距离
                 y_distance_from_center = abs(y_relative - self.vertical_perspective_center)
-                
-                # 上下透视增强因子：距离透视中心越远，变形越强
                 vertical_enhancement = 1.0 + (y_distance_from_center * self.vertical_perspective_strength)
                 
-                # 对Y方向偏移应用不同的缩放
-                enhanced_scale_y = enhanced_scale * vertical_enhancement
+                # 对X和Y方向偏移应用不同的缩放
+                enhanced_scale_x = enhanced_scale * horizontal_enhancement  # X方向使用左右透视增强
+                enhanced_scale_y = enhanced_scale * vertical_enhancement    # Y方向使用上下透视增强
                 
-                # 应用透视缩放（X和Y方向使用不同的缩放因子）
-                new_x_pixel = face_center_x_pixel + offset_x * enhanced_scale
+                # 应用透视缩放（X和Y方向使用独立的缩放因子）
+                new_x_pixel = face_center_x_pixel + offset_x * enhanced_scale_x  # X方向使用增强缩放
                 new_y_pixel = face_center_y_pixel + offset_y * enhanced_scale_y  # Y方向使用增强缩放
                 
                 # 转换回归一化坐标
@@ -665,7 +685,7 @@ class FaceLandmarkerCamera:
         # 显示透视投影状态
         if self.enable_perspective_projection:
             focal_length_equiv = int(35 / self.perspective_intensity) if self.perspective_intensity > 0 else 350
-            perspective_text = f'透视投影: 等效{focal_length_equiv}mm 深度{self.perspective_base_depth:.0f}±{self.perspective_depth_variation:.0f}cm 上下{self.vertical_perspective_strength:.1f}'
+            perspective_text = f'透视投影: 等效{focal_length_equiv}mm 深度{self.perspective_base_depth:.0f}±{self.perspective_depth_variation:.0f}cm 上下{self.vertical_perspective_strength:.1f} 左右{self.horizontal_perspective_strength:.1f}'
             image = self.put_chinese_text(image, perspective_text, 
                                         (10, height - 175), font_size=18, color=(255, 128, 255))
         else:
@@ -781,12 +801,14 @@ class FaceLandmarkerCamera:
             # 正确设置相机参数（遵循标准透视投影矩阵）
             # 焦距应该基于较小的尺寸来保持比例正确
             base_focal_length = min(camera_width, camera_height)
-            self.camera_fx = base_focal_length  # 使用较小尺寸作为基准焦距
-            self.camera_fy = base_focal_length  # Y方向使用相同焦距
+            # 【修改】增加焦距倍数，模拟更远的拍摄距离（从1.0倍增加到1.8倍）
+            focal_length_multiplier = 0.7  # 【修改】改为0.7倍，模拟广角镜头效果（相对于50mm标准镜头）
+            self.camera_fx = base_focal_length * focal_length_multiplier  # 使用广角焦距
+            self.camera_fy = base_focal_length * focal_length_multiplier  # Y方向使用相同焦距
             self.camera_cx = camera_width / 2.0   # 主点X坐标（图像中心）
             self.camera_cy = camera_height / 2.0  # 主点Y坐标（图像中心）
             
-            print(f"摄像头宽高比参数已更新 (手动估计模式):")
+            print(f"摄像头宽高比参数已更新 (手动估计模式，广角镜头焦距倍数: {focal_length_multiplier}x):")
         else:
             print(f"摄像头宽高比参数已更新 (保持真实校准参数):")
         
@@ -873,6 +895,7 @@ class FaceLandmarkerCamera:
         print("  '5/6' 键调整基础深度")
         print("  '7/8' 键调整深度变化范围")
         print("  '9/0' 键调整上下透视强度")
+        print("  '/*' 键调整左右透视强度")
         print("  'A/D' 键左右移动面部，'Z/C' 键上下移动面部")
         print("  'ESC' 键或 'Q' 键退出程序")
         
@@ -1060,6 +1083,12 @@ class FaceLandmarkerCamera:
                 elif key == ord('0'):  # '0' 键增大上下透视强度
                     self.vertical_perspective_strength = min(2.0, self.vertical_perspective_strength + 0.1)
                     print(f"上下透视强度: {self.vertical_perspective_strength:.1f}")
+                elif key == ord('/'):  # '/' 键减小左右透视强度
+                    self.horizontal_perspective_strength = max(0.0, self.horizontal_perspective_strength - 0.1)
+                    print(f"左右透视强度: {self.horizontal_perspective_strength:.1f}")
+                elif key == ord('*'):  # '*' 键增大左右透视强度
+                    self.horizontal_perspective_strength = min(2.0, self.horizontal_perspective_strength + 0.1)
+                    print(f"左右透视强度: {self.horizontal_perspective_strength:.1f}")
                 elif key == ord('A') or key == ord('a'):  # 'A' 或 'a' 键左右移动面部
                     self.face_offset_x = max(-1.0, self.face_offset_x - 0.05)
                     print(f"面部X方向偏移调整为: {self.face_offset_x:.2f}")
