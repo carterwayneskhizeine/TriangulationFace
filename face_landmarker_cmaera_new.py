@@ -122,12 +122,21 @@ class FaceLandmarkerCamera:
         # Face Geometry 模块
         self.enable_face_geometry = True  # 是否启用 Face Geometry 模块
         self.geometry_matrices = None
-        # 手动设置相机参数 (无需真实校准)
-        # 在 update_camera_aspect_ratio 中会更新为实际分辨率
-        self.manual_fx = self.camera_width
-        self.manual_fy = self.camera_height
-        self.manual_cx = self.camera_width / 2
-        self.manual_cy = self.camera_height / 2
+        
+        # 【关键修改】加载真实相机校准参数
+        self.use_real_calibration = True  # 是否使用真实校准参数
+        self.calibration_intrinsic_path = "Camera-Calibration/output/intrinsic.txt"  # 内参文件路径
+        self.calibration_extrinsic_path = "Camera-Calibration/output/extrinsic.txt"  # 外参文件路径
+        
+        # 相机参数（将根据真实校准或手动设置）
+        self.camera_fx = None
+        self.camera_fy = None
+        self.camera_cx = None
+        self.camera_cy = None
+        self.camera_skew = 0.0  # 倾斜参数
+        
+        # 加载相机校准参数
+        self.load_camera_calibration()
         
         print("人脸标志检测器初始化完成")
         print("按 'Q' 键退出程序")
@@ -149,6 +158,7 @@ class FaceLandmarkerCamera:
         print("按 '5' 键减小透视强度，'6' 键增大透视强度")
         print("按 '7' 键减小深度增强，'8' 键增大深度增强")
         print("按 'ESC' 键或 'Q' 键退出程序")
+        print(f"相机校准: {'使用真实校准' if self.use_real_calibration else '使用手动估计'}")
 
     def download_model(self):
         """下载人脸标志检测模型"""
@@ -213,7 +223,7 @@ class FaceLandmarkerCamera:
         options = FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=self.model_path),
             running_mode=VisionRunningMode.VIDEO,  # 视频模式
-            num_faces=2,  # 最多检测2张人脸
+            num_faces=1,  # 最多检测2张人脸
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -317,8 +327,8 @@ class FaceLandmarkerCamera:
                 z_norm = lm_norm[1,2]
                 # 将z_norm映射为深度值（示例映射，可按需调整）
                 depth = (0.5 - z_norm) * 2000.0
-                X = (x_p - self.manual_cx) * depth / self.manual_fx
-                Y = (y_p - self.manual_cy) * depth / self.manual_fy
+                X = (x_p - self.camera_cx) * depth / self.camera_fx
+                Y = (y_p - self.camera_cy) * depth / self.camera_fy
                 Z = depth
                 # 在图像上显示3D坐标
                 annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR)
@@ -356,8 +366,8 @@ class FaceLandmarkerCamera:
                 z_perspective = self.perspective_strength * z_weak + (1 - self.perspective_strength) * self.depth_enhancement
                 
                 # 透视投影逆变换：从2D像素坐标和深度得到3D坐标
-                x_3d = (x_pixel - self.manual_cx) * z_perspective / self.manual_fx
-                y_3d = (y_pixel - self.manual_cy) * z_perspective / self.manual_fy
+                x_3d = (x_pixel - self.camera_cx) * z_perspective / self.camera_fx
+                y_3d = (y_pixel - self.camera_cy) * z_perspective / self.camera_fy
                 
                 # 重新投影到归一化坐标，但保持透视效果
                 # 这里我们保持X,Y的相对关系，但调整Z以反映真实深度
@@ -386,11 +396,31 @@ class FaceLandmarkerCamera:
             
             perspective_dst = dst_landmarks.copy()
             
-            # 【重新设计】使用真正的透视投影公式
-            # 设置基础参数
-            focal_length = min(self.camera_width, self.camera_height) * 0.8  # 焦距
+            # 【重新设计】使用真正的透视投影公式，基于真实相机参数
+            # 使用真实的相机参数或回退到估计参数
+            if self.camera_fx is not None and self.camera_fy is not None:
+                # 使用真实校准的相机参数
+                focal_length_x = self.camera_fx
+                focal_length_y = self.camera_fy
+                principal_point_x = self.camera_cx
+                principal_point_y = self.camera_cy
+                print_debug = False  # 避免过多输出，只在第一帧显示
+            else:
+                # 回退到手动估计
+                focal_length_x = min(self.camera_width, self.camera_height) * 0.8
+                focal_length_y = focal_length_x
+                principal_point_x = self.camera_width / 2.0
+                principal_point_y = self.camera_height / 2.0
+                print_debug = False
+            
+            # 3D投影参数
             base_depth = 50.0  # 基础深度（厘米）
             depth_variation = 5.0  # 深度变化范围（厘米）
+            
+            if print_debug:
+                print(f"透视投影参数:")
+                print(f"  fx: {focal_length_x:.2f}, fy: {focal_length_y:.2f}")
+                print(f"  cx: {principal_point_x:.2f}, cy: {principal_point_y:.2f}")
              
             # 对每个landmark应用透视变换
             for i in range(len(dst_landmarks)):
@@ -404,17 +434,17 @@ class FaceLandmarkerCamera:
                 # Z值：负值表示离相机近，正值表示离相机远
                 z_3d = base_depth + (z_norm * depth_variation)
                 
-                # 将像素坐标转换为相机坐标系
-                x_3d = (x_pixel - self.camera_width/2) * z_3d / focal_length
-                y_3d = (y_pixel - self.camera_height/2) * z_3d / focal_length
+                # 将像素坐标转换为相机坐标系（使用真实的主点位置）
+                x_3d = (x_pixel - principal_point_x) * z_3d / focal_length_x
+                y_3d = (y_pixel - principal_point_y) * z_3d / focal_length_y
                 
                 # 【关键】应用透视投影：P' = f * P / Z
                 # 这里我们通过调整Z来产生透视效果
                 perspective_z = z_3d * (1.0 + z_norm * self.perspective_strength * self.depth_enhancement)  # 根据原始Z值调整透视深度
                 
-                # 重新投影到2D
-                new_x_pixel = (x_3d * focal_length / perspective_z) + self.camera_width/2
-                new_y_pixel = (y_3d * focal_length / perspective_z) + self.camera_height/2
+                # 重新投影到2D（使用对应的焦距）
+                new_x_pixel = (x_3d * focal_length_x / perspective_z) + principal_point_x
+                new_y_pixel = (y_3d * focal_length_y / perspective_z) + principal_point_y
                 
                 # 转换回归一化坐标
                 perspective_dst[i] = [
@@ -730,20 +760,35 @@ class FaceLandmarkerCamera:
         # 需要根据实际摄像头的宽高比进行修正
         self.x_scale_factor = self.aspect_ratio / 1.0  # 对于16:9，约为1.777
         
-        # 正确设置相机参数（遵循标准透视投影矩阵）
-        # 焦距应该基于较小的尺寸来保持比例正确
-        base_focal_length = min(camera_width, camera_height)
-        self.manual_fx = base_focal_length  # 使用较小尺寸作为基准焦距
-        self.manual_fy = base_focal_length  # Y方向使用相同焦距
-        self.manual_cx = camera_width / 2.0   # 主点X坐标（图像中心）
-        self.manual_cy = camera_height / 2.0  # 主点Y坐标（图像中心）
+        # 【修改】只在未使用真实校准参数时才更新相机参数
+        if not self.use_real_calibration or self.camera_fx is None:
+            # 正确设置相机参数（遵循标准透视投影矩阵）
+            # 焦距应该基于较小的尺寸来保持比例正确
+            base_focal_length = min(camera_width, camera_height)
+            self.camera_fx = base_focal_length  # 使用较小尺寸作为基准焦距
+            self.camera_fy = base_focal_length  # Y方向使用相同焦距
+            self.camera_cx = camera_width / 2.0   # 主点X坐标（图像中心）
+            self.camera_cy = camera_height / 2.0  # 主点Y坐标（图像中心）
+            
+            print(f"摄像头宽高比参数已更新 (手动估计模式):")
+        else:
+            print(f"摄像头宽高比参数已更新 (保持真实校准参数):")
         
-        print(f"摄像头宽高比参数已更新:")
         print(f"  实际分辨率: {camera_width}x{camera_height}")
         print(f"  宽高比: {self.aspect_ratio:.3f}")
         print(f"  X坐标修正系数: {self.x_scale_factor:.3f}")
-        print(f"  相机焦距: fx={self.manual_fx:.1f}, fy={self.manual_fy:.1f}")
-        print(f"  主点坐标: cx={self.manual_cx:.1f}, cy={self.manual_cy:.1f}")
+        
+        # 显示当前使用的相机参数
+        if self.camera_fx is not None:
+            print(f"  当前相机参数:")
+            print(f"    fx: {self.camera_fx:.2f}")
+            print(f"    fy: {self.camera_fy:.2f}")
+            print(f"    cx: {self.camera_cx:.2f}")
+            print(f"    cy: {self.camera_cy:.2f}")
+            if self.camera_skew != 0.0:
+                print(f"    skew: {self.camera_skew:.4f}")
+        else:
+            print("  警告：相机参数未设置")
 
     def update_fps(self):
         """更新FPS计算"""
@@ -1160,6 +1205,90 @@ class FaceLandmarkerCamera:
         self.enable_pixel_warp = False  # 重置像素变形状态
         self.previous_landmarks = None  # 重置平滑处理缓存
         print("已重置变换参数")
+
+    def load_camera_calibration(self):
+        """加载真实的相机校准参数"""
+        if not self.use_real_calibration:
+            print("未启用真实相机校准，将在运行时使用手动估计参数")
+            return
+        
+        try:
+            # 加载内参矩阵
+            if os.path.exists(self.calibration_intrinsic_path):
+                print(f"正在加载相机内参: {self.calibration_intrinsic_path}")
+                
+                # 读取内参文件
+                with open(self.calibration_intrinsic_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # 解析内参矩阵 - 支持多种格式
+                lines = content.strip().split('\n')
+                matrix_lines = []
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith('A=') and '[' in line and ']' in line:
+                        # 清理方括号并提取数字
+                        line = line.replace('[', '').replace(']', '')
+                        matrix_lines.append(line)
+                
+                if len(matrix_lines) >= 3:
+                    # 解析3x3内参矩阵
+                    intrinsic_matrix = []
+                    for line in matrix_lines[:3]:
+                        # 分割数字（处理可能的科学计数法）
+                        values = []
+                        parts = line.split()
+                        for part in parts:
+                            try:
+                                values.append(float(part))
+                            except ValueError:
+                                continue
+                        if len(values) >= 3:
+                            intrinsic_matrix.append(values[:3])
+                    
+                    if len(intrinsic_matrix) == 3:
+                        # 提取相机参数
+                        A = np.array(intrinsic_matrix)
+                        self.camera_fx = A[0, 0]  # fx
+                        self.camera_fy = A[1, 1]  # fy
+                        self.camera_cx = A[0, 2]  # cx (主点x坐标)
+                        self.camera_cy = A[1, 2]  # cy (主点y坐标)
+                        self.camera_skew = A[0, 1]  # skew (倾斜参数)
+                        
+                        print("成功加载相机内参:")
+                        print(f"  fx (x方向焦距): {self.camera_fx:.2f}")
+                        print(f"  fy (y方向焦距): {self.camera_fy:.2f}")
+                        print(f"  cx (主点x坐标): {self.camera_cx:.2f}")
+                        print(f"  cy (主点y坐标): {self.camera_cy:.2f}")
+                        print(f"  skew (倾斜参数): {self.camera_skew:.4f}")
+                    else:
+                        raise ValueError("无法解析内参矩阵格式")
+                else:
+                    raise ValueError("内参文件格式不正确")
+                    
+            else:
+                print(f"内参文件不存在: {self.calibration_intrinsic_path}")
+                self.use_real_calibration = False
+                return
+            
+            # 加载外参矩阵（可选，用于更复杂的3D投影）
+            if os.path.exists(self.calibration_extrinsic_path):
+                print(f"检测到外参文件: {self.calibration_extrinsic_path}")
+                # 注意：当前代码主要使用内参进行透视投影，外参暂不使用
+                # 如果需要更精确的3D几何计算，可以在这里加载外参矩阵
+            
+            print("相机校准参数加载完成")
+            
+        except Exception as e:
+            print(f"加载相机校准参数失败: {e}")
+            print("将回退到手动估计相机参数")
+            self.use_real_calibration = False
+            # 重置相机参数
+            self.camera_fx = None
+            self.camera_fy = None
+            self.camera_cx = None
+            self.camera_cy = None
+            self.camera_skew = 0.0
 
 
 def main():
