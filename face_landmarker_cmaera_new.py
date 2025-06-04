@@ -12,7 +12,6 @@ import time
 import urllib.request
 import os
 import csv
-from pycpd import DeformableRegistration
 from PIL import Image, ImageDraw, ImageFont
 import platform
 from face_warper import FaceWarper
@@ -58,7 +57,6 @@ class FaceLandmarkerCamera:
         self.N = 60
         self.warp_ready = False
         self.diff_transformed = None
-        # 变换参数文件路径修改为 npy 文件夹
         self.transform_file = os.path.join("npy", "face_transform.npy")  # 保存变换参数的文件
         
         # 加载中文字体用于GUI显示
@@ -84,6 +82,7 @@ class FaceLandmarkerCamera:
         self.previous_landmarks = None  # 用于平滑处理
         # 透视投影控制
         self.enable_perspective_projection = True  # 是否使用透视投影
+        self.enable_landmarks_perspective = True   # 是否在landmarks渲染时应用透视效果
         
         # 【新增】透视效果调节参数 (根据@修改透视，intensity的角色改变，主要依赖base_Z和delta_Z)
         self.perspective_base_depth = 45.0  # 基础深度（厘米）- 假设的标准拍摄距离
@@ -309,7 +308,14 @@ class FaceLandmarkerCamera:
                             # 以人脸中心X坐标为基准，只调整X坐标
                             warped_coords[:, 0] = face_center_x + (warped_coords[:, 0] - face_center_x) * self.width_scale
                         
-                        coords = warped_coords
+                        # 在landmarks渲染阶段应用透视变换
+                        if self.enable_perspective_projection and self.enable_landmarks_perspective:
+                            # 使用透视变换函数处理landmarks点
+                            display_coords = self.apply_perspective_warp_to_landmarks(None, warped_coords.copy())
+                        else:
+                            display_coords = warped_coords
+                        
+                        coords = display_coords
                     else:
                         # 原始landmarks模式，也应用宽度比例调整
                         if self.width_scale != 1.0:
@@ -317,6 +323,11 @@ class FaceLandmarkerCamera:
                             face_center_x = np.mean(coords[:, 0])
                             # 以人脸中心X坐标为基准，只调整X坐标
                             coords[:, 0] = face_center_x + (coords[:, 0] - face_center_x) * self.width_scale
+                        
+                        # 即使在原始模式下，也可以应用透视效果
+                        if self.enable_perspective_projection and self.enable_landmarks_perspective and not self.show_warped:
+                            # 注意：这里我们仅对显示坐标应用透视，不影响原始坐标
+                            coords = self.apply_perspective_warp_to_landmarks(None, coords.copy())
                     
                     # 根据显示控制决定是否绘制landmarks
                     if self.show_landmarks:
@@ -371,6 +382,13 @@ class FaceLandmarkerCamera:
         """
         对landmarks应用真正的透视投影变形
         修正之前的数学错误，实现有效的透视效果
+        
+        Args:
+            src_landmarks: 原始landmarks坐标，可以为None
+            dst_landmarks: 目标landmarks坐标，将应用透视变换
+            
+        Returns:
+            应用透视变换后的landmarks坐标
         """
         try:
             if not self.enable_perspective_projection:
@@ -508,7 +526,7 @@ class FaceLandmarkerCamera:
             
             # 应用透视投影变形
             if self.enable_perspective_projection:
-                warped_coords = self.apply_perspective_warp_to_landmarks(original_coords, warped_coords)
+                warped_coords = self.apply_perspective_warp_to_landmarks(None, warped_coords)
                 print(f"透视投影已应用，基础深度: {self.perspective_base_depth:.0f}cm, 深度变化: {self.perspective_depth_variation:.0f}cm")
             
             # 【新增】应用面部整体平移
@@ -673,6 +691,10 @@ class FaceLandmarkerCamera:
             perspective_text = f'透视投影: 基础深度{self.perspective_base_depth:.0f}cm 深度变化{self.perspective_depth_variation:.0f}cm ({effect_type})'
             image = self.put_chinese_text(image, perspective_text, 
                                         (10, height - 175), font_size=18, color=(255, 128, 255))
+            # 显示landmarks渲染透视状态
+            landmarks_perspective_text = f'Landmarks渲染透视: {"开启" if self.enable_landmarks_perspective else "关闭"} (按Y切换)'
+            image = self.put_chinese_text(image, landmarks_perspective_text, 
+                                        (10, height - 235), font_size=18, color=(128, 255, 255))
         else:
             image = self.put_chinese_text(image, '透视投影已关闭 (弱透视模式)', 
                                         (10, height - 175), font_size=18, color=(128, 128, 128))
@@ -876,7 +898,7 @@ class FaceLandmarkerCamera:
         
         frame_count = 0
         
-        print("开始实时检测，按键控制:")
+        print("按键控制:")
         print("  'Q' 或 ESC - 退出")
         print("  'S' - 保存当前帧")
         print("  'R' - 开始/停止录制输出视频")
@@ -893,6 +915,7 @@ class FaceLandmarkerCamera:
         print("  'O' 键切换面部专用模式 (只显示面部，背景纯黑)")
         print("  'R' - 开始/停止录制输出视频")
         print("  'T' 键切换透视投影/弱透视投影")
+        print("  'Y' 键切换landmarks渲染的透视效果")
         print("  '1/2' 键调整透视强度 (模拟不同焦距)")
         print("  '5/6' 键调整基础深度 (距离远近)")
         print("  '7/8' 键调整深度变化范围 (立体感强弱)")
@@ -1060,6 +1083,9 @@ class FaceLandmarkerCamera:
                     else:
                         self.enable_perspective_projection = True
                         print("切换到透视投影")
+                elif key == ord('Y') or key == ord('y'):  # 'Y' 或 'y' 键切换landmarks渲染的透视效果
+                    self.enable_landmarks_perspective = not self.enable_landmarks_perspective
+                    print(f"Landmarks渲染透视效果: {'开启' if self.enable_landmarks_perspective else '关闭'}")
                 elif key == ord('1'):  # '1' 键减小透视强度（模拟长焦镜头）
                     self.perspective_intensity = max(0.1, self.perspective_intensity - 0.1)
                     focal_length_equiv = int(35 / self.perspective_intensity) if self.perspective_intensity > 0 else 350
@@ -1162,67 +1188,47 @@ class FaceLandmarkerCamera:
 
     def estimate_transform(self, avg_landmarks):
         """
-        利用非刚性 CPD 把自定义模型顶点对齐到活人脸，
-        生成 per-vertex 形变差异 self.diff_transformed，
-        并保持面部大小与原始landmarks一致
+        使用非刚性拉伸方案：将自定义模型对齐到活人脸，计算形状差异
         """
         if self.custom_vertices is None:
             print("自定义模型未加载，无法计算变换")
             return
-
-        # ---- 0. 预处理：把 landmarks x 坐标拉伸到真正的宽高比 ----
-        tgt = avg_landmarks.copy()
-        tgt[:, 0] *= self.x_scale_factor        # → (N,3) 目标点云
-
-        # ---- 1. 先做一次刚性粗配准，保证大致位置一致 ----
-        R, s, t = self.compute_similarity_transform(self.custom_vertices, tgt)
-        src_coarse = (s * (R @ self.custom_vertices.T).T) + t   # (N,3)
-
-        # ---- 2. 非刚性 CPD 微调形变 ----
-        reg = DeformableRegistration(X=src_coarse, Y=tgt,
-                                    beta=2.0,       # 高斯核尺度，越小→越局部
-                                    lamb=3.0)       # 正则，越大→越平滑
-        TY, _ = reg.register()                      # TY = 形变后的自定义模型
         
-        # ---- 3. 应用缩放修正，保持面部大小 ----
-        # 获取变形前后的面部尺寸
-        tgt_width = np.max(tgt[:, 0]) - np.min(tgt[:, 0])
-        tgt_height = np.max(tgt[:, 1]) - np.min(tgt[:, 1])
+        print("开始计算自定义模型到活人脸的变换...")
+        print(f"视频分辨率: {self.camera_width}x{self.camera_height}")
+        print(f"视频宽高比: {self.aspect_ratio:.3f}")
+        print(f"X坐标修正系数: {self.x_scale_factor:.3f}")
         
-        ty_width = np.max(TY[:, 0]) - np.min(TY[:, 0])
-        ty_height = np.max(TY[:, 1]) - np.min(TY[:, 1])
+        # 修正平均landmarks的x坐标以适应宽高比
+        corrected_landmarks = avg_landmarks.copy()
+        corrected_landmarks[:, 0] *= self.x_scale_factor  # 只修正x坐标
+        print(f"X坐标修正前范围: [{avg_landmarks[:, 0].min():.4f}, {avg_landmarks[:, 0].max():.4f}]")
+        print(f"X坐标修正后范围: [{corrected_landmarks[:, 0].min():.4f}, {corrected_landmarks[:, 0].max():.4f}]")
         
-        # 计算尺寸比例
-        width_ratio = tgt_width / ty_width if ty_width > 0 else 1.0
-        height_ratio = tgt_height / ty_height if ty_height > 0 else 1.0
+        # 计算从自定义模型到活人脸的相似变换
+        R, s, t = self.compute_similarity_transform(self.custom_vertices, corrected_landmarks)
         
-        # 选择一个合适的缩放因子（可以取平均值或者最大值）
-        scale_factor = max(width_ratio, height_ratio)
+        # 将自定义模型变换到活人脸坐标系
+        custom_in_live = (s * (R @ self.custom_vertices.T).T) + t
         
-        # 获取中心点
-        ty_center = np.mean(TY, axis=0)
+        # 计算形状差异向量：变换后的自定义模型 - 修正后的活人脸平均位置
+        self.diff_transformed = custom_in_live - corrected_landmarks
         
-        # 对变形结果应用缩放修正，保持中心点不变
-        TY_scaled = ty_center + (TY - ty_center) * scale_factor
-        
-        print(f"应用缩放修正: {scale_factor:.2f}倍")
-
-        # ---- 4. 形状差异向量（回到原始 16:9 坐标系） ----
-        diff = TY_scaled - tgt
-        diff[:, 0] /= self.x_scale_factor           # 把 x 还原
-        self.diff_transformed = diff
+        # 将差异的x坐标还原到原始坐标系
+        self.diff_transformed[:, 0] /= self.x_scale_factor
         self.warp_ready = True
-
-        # ---- 5. 持久化 ----
-        np.save(self.transform_file, self.diff_transformed)
-        print(f"非刚性变换完成，已保存到 {self.transform_file}")
-        print(f"差异范围: ΔX[{diff[:,0].min():.4f},{diff[:,0].max():.4f}] "
-              f"ΔY[{diff[:,1].min():.4f},{diff[:,1].max():.4f}] "
-              f"ΔZ[{diff[:,2].min():.4f},{diff[:,2].max():.4f}]")
-        print(f"变形前尺寸: 宽={tgt_width:.4f}, 高={tgt_height:.4f}")
-        print(f"变形后尺寸: 宽={ty_width:.4f}, 高={ty_height:.4f}")
-        print(f"修正后尺寸: 宽={ty_width*scale_factor:.4f}, 高={ty_height*scale_factor:.4f}")
-
+        
+        # 保存变换参数到文件
+        try:
+            np.save(self.transform_file, self.diff_transformed)
+            print(f"变换参数已保存到: {self.transform_file}")
+        except Exception as e:
+            print(f"保存变换参数失败: {e}")
+        
+        print("已计算自定义模型形状差异，实时变形已启用")
+        print(f"形状差异范围: X=[{self.diff_transformed[:, 0].min():.4f}, {self.diff_transformed[:, 0].max():.4f}]")
+        print(f"              Y=[{self.diff_transformed[:, 1].min():.4f}, {self.diff_transformed[:, 1].max():.4f}]")
+        print(f"              Z=[{self.diff_transformed[:, 2].min():.4f}, {self.diff_transformed[:, 2].max():.4f}]")
 
     def load_chinese_font(self):
         """加载中文字体用于GUI显示"""
