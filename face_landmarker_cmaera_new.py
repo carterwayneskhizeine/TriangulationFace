@@ -12,6 +12,7 @@ import time
 import urllib.request
 import os
 import csv
+from pycpd import DeformableRegistration
 from PIL import Image, ImageDraw, ImageFont
 import platform
 from face_warper import FaceWarper
@@ -451,7 +452,7 @@ class FaceLandmarkerCamera:
                 projected_dst[i, 2] = zn  # 保持原始z值用于其他处理
 
             return projected_dst
-
+            
         except Exception as e:
             print(f"透视变形失败: {e}")
             import traceback
@@ -1160,46 +1161,40 @@ class FaceLandmarkerCamera:
 
     def estimate_transform(self, avg_landmarks):
         """
-        使用非刚性拉伸方案：将自定义模型对齐到活人脸，计算形状差异
+        利用非刚性 CPD 把自定义模型顶点对齐到活人脸，
+        生成 per-vertex 形变差异 self.diff_transformed
         """
         if self.custom_vertices is None:
             print("自定义模型未加载，无法计算变换")
             return
-        
-        print("开始计算自定义模型到活人脸的变换...")
-        print(f"视频分辨率: {self.camera_width}x{self.camera_height}")
-        print(f"视频宽高比: {self.aspect_ratio:.3f}")
-        print(f"X坐标修正系数: {self.x_scale_factor:.3f}")
-        
-        # 修正平均landmarks的x坐标以适应宽高比
-        corrected_landmarks = avg_landmarks.copy()
-        corrected_landmarks[:, 0] *= self.x_scale_factor  # 只修正x坐标
-        print(f"X坐标修正前范围: [{avg_landmarks[:, 0].min():.4f}, {avg_landmarks[:, 0].max():.4f}]")
-        print(f"X坐标修正后范围: [{corrected_landmarks[:, 0].min():.4f}, {corrected_landmarks[:, 0].max():.4f}]")
-        
-        # 计算从自定义模型到活人脸的相似变换
-        R, s, t = self.compute_similarity_transform(self.custom_vertices, corrected_landmarks)
-        
-        # 将自定义模型变换到活人脸坐标系
-        custom_in_live = (s * (R @ self.custom_vertices.T).T) + t
-        
-        # 计算形状差异向量：变换后的自定义模型 - 修正后的活人脸平均位置
-        self.diff_transformed = custom_in_live - corrected_landmarks
-        
-        # 将差异的x坐标还原到原始坐标系
-        self.diff_transformed[:, 0] /= self.x_scale_factor
+
+        # ---- 0. 预处理：把 landmarks x 坐标拉伸到真正的宽高比 ----
+        tgt = avg_landmarks.copy()
+        tgt[:, 0] *= self.x_scale_factor        # → (N,3) 目标点云
+
+        # ---- 1. 先做一次刚性粗配准，保证大致位置一致 ----
+        R, s, t = self.compute_similarity_transform(self.custom_vertices, tgt)
+        src_coarse = (s * (R @ self.custom_vertices.T).T) + t   # (N,3)
+
+        # ---- 2. 非刚性 CPD 微调形变 ----
+        reg = DeformableRegistration(X=src_coarse, Y=tgt,
+                                    beta=2.0,       # 高斯核尺度，越小→越局部
+                                    lamb=3.0)       # 正则，越大→越平滑
+        TY, _ = reg.register()                       # TY = 形变后的自定义模型
+
+        # ---- 3. 形状差异向量（回到原始 16:9 坐标系） ----
+        diff = TY - tgt
+        diff[:, 0] /= self.x_scale_factor           # 把 x 还原
+        self.diff_transformed = diff
         self.warp_ready = True
-        
-        # 保存变换参数到文件
-        try:
-            np.save(self.transform_file, self.diff_transformed)
-            print(f"变换参数已保存到: {self.transform_file}")
-        except Exception as e:
-            print(f"保存变换参数失败: {e}")
-        
-        print("已计算自定义模型形状差异，实时变形已启用")
-        print(f"形状差异范围: X=[{self.diff_transformed[:, 0].min():.4f}, {self.diff_transformed[:, 0].max():.4f}]")
-        print(f"              Y=[{self.diff_transformed[:, 1].min():.4f}, {self.diff_transformed[:, 1].max():.4f}]")
+
+        # ---- 4. 持久化 ----
+        np.save(self.transform_file, self.diff_transformed)
+        print(f"非刚性变换完成，已保存到 {self.transform_file}")
+        print(f"差异范围: ΔX[{diff[:,0].min():.4f},{diff[:,0].max():.4f}] "
+            f"ΔY[{diff[:,1].min():.4f},{diff[:,1].max():.4f}] "
+            f"ΔZ[{diff[:,2].min():.4f},{diff[:,2].max():.4f}]")
+
 
     def load_chinese_font(self):
         """加载中文字体用于GUI显示"""
