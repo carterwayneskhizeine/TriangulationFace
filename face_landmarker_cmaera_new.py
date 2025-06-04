@@ -38,20 +38,6 @@ class FaceLandmarkerCamera:
             os.makedirs(self.output_dir)
             print(f"创建输出文件夹: {self.output_dir}")
         
-        # 创建 CSV 输出文件夹
-        self.csv_dir = "csv_files"
-        if not os.path.exists(self.csv_dir):
-            os.makedirs(self.csv_dir)
-            print(f"创建 CSV 输出文件夹: {self.csv_dir}")
-        
-        # 标记第 55 帧 landmarks 是否已保存
-        self.saved_frame55 = False
-        
-        # 模型坐标系转换参数
-        self.model_scale_factor = 0.01    # 模型缩放因子 (将大模型缩小到合适尺寸)
-        self.model_rotation_x = -90       # 模型X轴旋转角度 (修正上下颠倒)
-        self.model_y_aspect_fix = 1.777   # 模型Y轴宽高比调整 (适应16:9)
-        
         # 下载模型文件
         self.model_path = self.download_model()
         
@@ -66,12 +52,6 @@ class FaceLandmarkerCamera:
         except Exception as e:
             print(f"自定义模型加载失败: {e}")
             self.custom_vertices = None
-        
-        # 将自定义模型顶点保存为 CSV
-        if self.custom_vertices is not None:
-            self.save_coords_to_csv(self.custom_vertices, 'model_landmarks.csv', apply_inverse_transform=True)
-            print(f"自定义模型顶点已保存为 CSV: {os.path.join(self.csv_dir, 'model_landmarks.csv')}")
-        
         self.landmark_buffer = []
         self.frame_count = 0
         self.N = 60
@@ -201,6 +181,7 @@ class FaceLandmarkerCamera:
         print("按 '/*' 键调整左右透视强度")
         print("按 'A/D' 键左右移动面部，'Z/C' 键上下移动面部")
         print("按 'J/L' 键调节透视中心X偏移，'I/K' 键调节透视中心Y偏移")
+        print("按 'ESC' 键或 'Q' 键退出程序")
         print(f"相机校准: {'使用真实校准' if self.use_real_calibration else '使用手动估计'}")
 
     def download_model(self):
@@ -884,6 +865,7 @@ class FaceLandmarkerCamera:
         """运行摄像头实时人脸检测"""
         if not self.landmarker:
             print("人脸标志检测器初始化失败，请检查模型文件")
+            print("请确保模型文件 'face_landmarker.task' 存在且完整")
             return
         
         # 打开摄像头
@@ -947,6 +929,7 @@ class FaceLandmarkerCamera:
             while True:
                 ret, frame = cap.read()
                 if not ret:
+                    print("错误：无法从摄像头读取图像")
                     break
                 
                 frame_count += 1
@@ -971,12 +954,6 @@ class FaceLandmarkerCamera:
                     coords = np.array([[lm.x, lm.y, lm.z] for lm in landmarks[:468]], dtype=np.float32)
                     self.landmark_buffer.append(coords)
                     self.frame_count += 1
-                    
-                    # 第 55 帧时保存 landmarks
-                    if self.frame_count == 55 and not self.saved_frame55:
-                        self.save_coords_to_csv(coords, 'frame55_landmarks.csv')
-                        print(f"已保存第55帧 landmarks: {os.path.join(self.csv_dir, 'frame55_landmarks.csv')}")
-                        self.saved_frame55 = True
                     
                     if self.frame_count >= self.N:
                         print("开始计算相似变换...")
@@ -1181,7 +1158,6 @@ class FaceLandmarkerCamera:
     def load_obj_vertices(self, path):
         """
         从 OBJ 文件加载顶点 (v x y z)，返回 (N,3) numpy 数组
-        并应用正确的坐标变换，使其与 MediaPipe 坐标系兼容
         """
         verts = []
         with open(path, 'r', encoding='utf-8') as f:
@@ -1190,35 +1166,7 @@ class FaceLandmarkerCamera:
                     parts = line.strip().split()
                     x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
                     verts.append([x, y, z])
-        
-        # 转换为numpy数组
-        verts_array = np.array(verts, dtype=np.float32)
-        
-        # 应用变换使其与MediaPipe坐标系兼容
-        # 1. 缩放 - 从原始大小缩放到适当尺寸
-        verts_array *= self.model_scale_factor
-        
-        # 2. 绕X轴旋转 - 修正上下颠倒问题
-        theta = np.radians(self.model_rotation_x)
-        rotation_matrix = np.array([
-            [1, 0, 0],
-            [0, np.cos(theta), -np.sin(theta)],
-            [0, np.sin(theta), np.cos(theta)]
-        ])
-        
-        # 应用旋转
-        verts_array = np.dot(verts_array, rotation_matrix.T)
-        
-        # 3. Y轴缩放调整为适应宽高比
-        verts_array[:, 1] *= self.model_y_aspect_fix
-        
-        print(f"已加载并变换OBJ模型: {path}")
-        print(f"  应用的变换: 缩放={self.model_scale_factor}, X轴旋转={self.model_rotation_x}°, Y轴缩放={self.model_y_aspect_fix}")
-        print(f"  变换后顶点范围: X=[{verts_array[:, 0].min():.4f}, {verts_array[:, 0].max():.4f}]")
-        print(f"                  Y=[{verts_array[:, 1].min():.4f}, {verts_array[:, 1].max():.4f}]")
-        print(f"                  Z=[{verts_array[:, 2].min():.4f}, {verts_array[:, 2].max():.4f}]")
-        
-        return verts_array
+        return np.array(verts, dtype=np.float32)
 
     def compute_similarity_transform(self, src, dst):
         """
@@ -1241,7 +1189,6 @@ class FaceLandmarkerCamera:
     def estimate_transform(self, avg_landmarks):
         """
         使用非刚性拉伸方案：将自定义模型对齐到活人脸，计算形状差异
-        考虑到模型和活人脸可能存在的坐标系差异
         """
         if self.custom_vertices is None:
             print("自定义模型未加载，无法计算变换")
@@ -1252,32 +1199,17 @@ class FaceLandmarkerCamera:
         print(f"视频宽高比: {self.aspect_ratio:.3f}")
         print(f"X坐标修正系数: {self.x_scale_factor:.3f}")
         
-        # 分析原始landmarks范围
-        print(f"原始landmarks范围: X=[{avg_landmarks[:, 0].min():.4f}, {avg_landmarks[:, 0].max():.4f}]")
-        print(f"                  Y=[{avg_landmarks[:, 1].min():.4f}, {avg_landmarks[:, 1].max():.4f}]")
-        print(f"                  Z=[{avg_landmarks[:, 2].min():.4f}, {avg_landmarks[:, 2].max():.4f}]")
-        
         # 修正平均landmarks的x坐标以适应宽高比
         corrected_landmarks = avg_landmarks.copy()
         corrected_landmarks[:, 0] *= self.x_scale_factor  # 只修正x坐标
+        print(f"X坐标修正前范围: [{avg_landmarks[:, 0].min():.4f}, {avg_landmarks[:, 0].max():.4f}]")
         print(f"X坐标修正后范围: [{corrected_landmarks[:, 0].min():.4f}, {corrected_landmarks[:, 0].max():.4f}]")
-        
-        # 分析自定义模型顶点范围（已在load_obj_vertices中预处理过）
-        print(f"自定义模型顶点范围: X=[{self.custom_vertices[:, 0].min():.4f}, {self.custom_vertices[:, 0].max():.4f}]")
-        print(f"                   Y=[{self.custom_vertices[:, 1].min():.4f}, {self.custom_vertices[:, 1].max():.4f}]")
-        print(f"                   Z=[{self.custom_vertices[:, 2].min():.4f}, {self.custom_vertices[:, 2].max():.4f}]")
         
         # 计算从自定义模型到活人脸的相似变换
         R, s, t = self.compute_similarity_transform(self.custom_vertices, corrected_landmarks)
-        print(f"计算的变换参数: 缩放={s:.4f}")
         
         # 将自定义模型变换到活人脸坐标系
         custom_in_live = (s * (R @ self.custom_vertices.T).T) + t
-        
-        # 打印变换后的模型范围
-        print(f"变换后模型范围: X=[{custom_in_live[:, 0].min():.4f}, {custom_in_live[:, 0].max():.4f}]")
-        print(f"                Y=[{custom_in_live[:, 1].min():.4f}, {custom_in_live[:, 1].max():.4f}]")
-        print(f"                Z=[{custom_in_live[:, 2].min():.4f}, {custom_in_live[:, 2].max():.4f}]")
         
         # 计算形状差异向量：变换后的自定义模型 - 修正后的活人脸平均位置
         self.diff_transformed = custom_in_live - corrected_landmarks
@@ -1285,11 +1217,6 @@ class FaceLandmarkerCamera:
         # 将差异的x坐标还原到原始坐标系
         self.diff_transformed[:, 0] /= self.x_scale_factor
         self.warp_ready = True
-        
-        # 调试输出：显示几个关键点的差异值
-        print("关键点差异示例（前5个点）:")
-        for i in range(min(5, len(self.diff_transformed))):
-            print(f"  点{i}: [{self.diff_transformed[i, 0]:.4f}, {self.diff_transformed[i, 1]:.4f}, {self.diff_transformed[i, 2]:.4f}]")
         
         # 保存变换参数到文件
         try:
@@ -1469,177 +1396,15 @@ class FaceLandmarkerCamera:
             self.camera_cy = None
             self.camera_skew = 0.0
 
-    def save_coords_to_csv(self, coords, filename, apply_inverse_transform=False):
-        """
-        保存 numpy 坐标数组到 CSV 文件: point_id,x,y,z
-        
-        Args:
-            coords: 要保存的坐标数组，形状为(N,3)
-            filename: 输出CSV文件名
-            apply_inverse_transform: 是否应用逆变换，使输出与原始OBJ兼容
-        """
-        if coords is None or len(coords) == 0:
-            print("没有坐标数据可保存")
-            return False
-            
-        filepath = os.path.join(self.csv_dir, filename)
-        
-        try:
-            # 如果需要应用逆变换
-            if apply_inverse_transform and "model" in filename:
-                print("对模型坐标应用逆变换以匹配原始OBJ格式...")
-                transformed_coords = coords.copy()
-                
-                # 1. 撤销Y轴宽高比缩放
-                transformed_coords[:, 1] /= self.model_y_aspect_fix
-                
-                # 2. 撤销X轴旋转
-                # 使用负角度，因为要撤销之前的旋转
-                theta = np.radians(-self.model_rotation_x)
-                rotation_matrix = np.array([
-                    [1, 0, 0],
-                    [0, np.cos(theta), -np.sin(theta)],
-                    [0, np.sin(theta), np.cos(theta)]
-                ])
-                transformed_coords = np.dot(transformed_coords, rotation_matrix.T)
-                
-                # 3. 撤销缩放
-                transformed_coords /= self.model_scale_factor
-                
-                # 使用变换后的坐标
-                export_coords = transformed_coords
-                print(f"逆变换后坐标范围: X=[{export_coords[:, 0].min():.4f}, {export_coords[:, 0].max():.4f}]")
-                print(f"                 Y=[{export_coords[:, 1].min():.4f}, {export_coords[:, 1].max():.4f}]")
-                print(f"                 Z=[{export_coords[:, 2].min():.4f}, {export_coords[:, 2].max():.4f}]")
-            else:
-                # 使用原始坐标
-                export_coords = coords
-            
-            # 写入CSV文件
-            with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['point_id', 'x', 'y', 'z'])
-                for idx, (x, y, z) in enumerate(export_coords):
-                    writer.writerow([idx, float(x), float(y), float(z)])
-                    
-            print(f"坐标已保存到 CSV 文件: {filepath}")
-            print(f"点数: {len(export_coords)}")
-            return True
-            
-        except Exception as e:
-            print(f"保存坐标 CSV 失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def analyze_face_model_diff(self, frame55_landmarks=None):
-        """
-        分析第55帧活人脸和模型之间的差异
-        可选载入之前保存的第55帧landmarks
-        """
-        print("\n===== 分析活人脸与模型差异 =====")
-        
-        # 1. 如果没有提供第55帧landmarks，尝试从CSV文件加载
-        if frame55_landmarks is None:
-            frame55_file = os.path.join(self.csv_dir, 'frame55_landmarks.csv')
-            if os.path.exists(frame55_file):
-                print(f"从CSV加载第55帧landmarks: {frame55_file}")
-                frame55_landmarks = self.load_landmarks_from_csv(frame55_file)
-            else:
-                print(f"未找到第55帧landmarks文件: {frame55_file}")
-                print("请先运行程序并按M键，让它收集第55帧")
-                return
-        
-        # 2. 确保模型已加载
-        if self.custom_vertices is None:
-            print("自定义模型未加载，无法分析差异")
-            return
-            
-        # 3. 分析两者的差异
-        print("\n原始数据范围比较:")
-        print(f"活人脸landmarks范围: X=[{frame55_landmarks[:, 0].min():.4f}, {frame55_landmarks[:, 0].max():.4f}]")
-        print(f"                   Y=[{frame55_landmarks[:, 1].min():.4f}, {frame55_landmarks[:, 1].max():.4f}]")
-        print(f"                   Z=[{frame55_landmarks[:, 2].min():.4f}, {frame55_landmarks[:, 2].max():.4f}]")
-        
-        print(f"模型顶点范围: X=[{self.custom_vertices[:, 0].min():.4f}, {self.custom_vertices[:, 0].max():.4f}]")
-        print(f"             Y=[{self.custom_vertices[:, 1].min():.4f}, {self.custom_vertices[:, 1].max():.4f}]")
-        print(f"             Z=[{self.custom_vertices[:, 2].min():.4f}, {self.custom_vertices[:, 2].max():.4f}]")
-        
-        # 4. 计算基于第55帧的形状差异
-        corrected_landmarks = frame55_landmarks.copy()
-        corrected_landmarks[:, 0] *= self.x_scale_factor  # 应用宽高比校正
-        
-        # 计算从模型到第55帧的相似变换
-        R, s, t = self.compute_similarity_transform(self.custom_vertices, corrected_landmarks)
-        print(f"\n第55帧相似变换参数: 缩放={s:.4f}")
-        
-        # 将模型变换到第55帧坐标系
-        model_in_frame55 = (s * (R @ self.custom_vertices.T).T) + t
-        
-        # 计算变换后的形状差异
-        diff = model_in_frame55 - corrected_landmarks
-        
-        # 5. 显示差异统计
-        print("\n形状差异统计:")
-        print(f"X轴差异: 最小={diff[:, 0].min():.4f}, 最大={diff[:, 0].max():.4f}, 平均={np.mean(diff[:, 0]):.4f}, 标准差={np.std(diff[:, 0]):.4f}")
-        print(f"Y轴差异: 最小={diff[:, 1].min():.4f}, 最大={diff[:, 1].max():.4f}, 平均={np.mean(diff[:, 1]):.4f}, 标准差={np.std(diff[:, 1]):.4f}")
-        print(f"Z轴差异: 最小={diff[:, 2].min():.4f}, 最大={diff[:, 2].max():.4f}, 平均={np.mean(diff[:, 2]):.4f}, 标准差={np.std(diff[:, 2]):.4f}")
-        
-        # 6. 显示一些关键点的差异
-        print("\n关键点差异示例:")
-        key_points = [0, 1, 33, 61, 152, 234, 323, 398, 420, 467]  # 选择一些特征点
-        for i in key_points:
-            if i < len(diff):
-                print(f"点{i}: [{diff[i, 0]:.4f}, {diff[i, 1]:.4f}, {diff[i, 2]:.4f}]")
-        
-        print("\n===== 分析完成 =====")
-        
-        return diff
-        
-    def load_landmarks_from_csv(self, csv_file):
-        """从CSV文件加载landmarks"""
-        try:
-            points = []
-            with open(csv_file, 'r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                next(reader)  # 跳过表头
-                for row in reader:
-                    if len(row) >= 4:
-                        # point_id, x, y, z
-                        points.append([float(row[1]), float(row[2]), float(row[3])])
-                        
-            return np.array(points, dtype=np.float32)
-        except Exception as e:
-            print(f"加载CSV文件失败: {e}")
-            return None
-
 
 def main():
     """主函数"""
-    import argparse
-    
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(description="MediaPipe 人脸标志检测器 - 摄像头实时版")
-    parser.add_argument('--analyze', action='store_true', help='分析已保存的第55帧landmarks和模型差异')
-    parser.add_argument('--camera', type=int, default=0, help='摄像头ID (默认: 0)')
-    args = parser.parse_args()
-    
     print("MediaPipe 人脸标志检测器 - 摄像头实时版")
     print("=" * 50)
     
-    # 创建检测器
-    detector = FaceLandmarkerCamera(camera_id=args.camera)
-    
-    # 如果指定了分析模式，直接分析已保存的数据
-    if args.analyze:
-        print("运行分析模式...")
-        if os.path.exists(os.path.join(detector.csv_dir, 'frame55_landmarks.csv')):
-            detector.analyze_face_model_diff()
-        else:
-            print("错误: 未找到第55帧landmarks文件，请先运行程序并按M键采集数据")
-    else:
-        # 正常运行摄像头模式
-        detector.run() 
+    # 创建并运行检测器
+    detector = FaceLandmarkerCamera()
+    detector.run()
 
 
 if __name__ == "__main__":
