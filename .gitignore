@@ -1,3 +1,5 @@
 video_output_file
 __pycache__
 npy
+csv_files
+result_file
