@@ -288,7 +288,9 @@ class FaceLandmarkerCamera:
                         corrected_coords = coords.copy()
                         corrected_coords[:, 0] *= self.x_scale_factor
                         
-                        # 直接加上形状差异，将活人脸变形为自定义模型的形状
+                        # 【重要修改】新的差异应用方式：当前landmarks + 差异 = 目标形状
+                        # 由于新的diff_transformed = 目标模型 - 对齐后活人脸
+                        # 所以：当前活人脸 + diff_transformed = 目标模型形状
                         warped_coords = corrected_coords + self.diff_transformed
                         
                         # 将变形后的x坐标还原到16:9坐标系
@@ -562,7 +564,7 @@ class FaceLandmarkerCamera:
         pass
     
     def save_landmarks_to_csv(self, landmarks_list, filename=None):
-        """保存landmarks到CSV文件"""
+        """保存landmarks到CSV文件（用于按L键保存当前帧）"""
         if not landmarks_list:
             print("没有landmarks数据可保存")
             return False
@@ -905,6 +907,7 @@ class FaceLandmarkerCamera:
         print("  'M' - 重新检测并计算变换")
         print("  'X' - 切换原始/变形显示")
         print("  'P' - 切换像素级变形")
+        print("  'E' - 导出变形后的人脸模型为OBJ文件")
         print("  'H' - 隐藏/显示landmarks线框")
         print("  '[' 键缩小landmarks，']' 键放大landmarks")
         print("  '3' 键减小宽度比例，'4' 键增大宽度比例")
@@ -931,6 +934,7 @@ class FaceLandmarkerCamera:
                 if not ret:
                     print("错误：无法从摄像头读取图像")
                     break
+                frame = cv2.flip(frame, 1)  # 左右翻转（镜像）
                 
                 frame_count += 1
                 
@@ -1021,6 +1025,34 @@ class FaceLandmarkerCamera:
                             print("像素级人脸变形已关闭")
                     else:
                         print("请先启用变形功能（按M键检测，按X键切换到变形显示）")
+                elif key == ord('E') or key == ord('e'):  # 'E' 或 'e' 键导出变形后的landmarks为OBJ文件
+                    if self.warp_ready and self.diff_transformed is not None and detection_result and detection_result.face_landmarks:
+                        # 获取当前帧的landmarks
+                        current_landmarks = np.array([[lm.x, lm.y, lm.z] for lm in detection_result.face_landmarks[0][:468]], dtype=np.float32)
+                        
+                        # 修正x坐标（与实时变形保持一致）
+                        corrected_coords = current_landmarks.copy()
+                        corrected_coords[:, 0] *= self.x_scale_factor
+                        
+                        # 应用形状差异变换
+                        warped_coords = corrected_coords + self.diff_transformed
+                        
+                        # 还原x坐标到16:9坐标系
+                        warped_coords[:, 0] /= self.x_scale_factor
+                        
+                        # 导出为OBJ文件
+                        exported_file = self.export_warped_landmarks_to_obj(warped_coords)
+                        if exported_file:
+                            print(f"✅ 变形后的人脸模型已导出: {exported_file}")
+                        else:
+                            print("❌ 导出变形后的人脸模型失败")
+                    else:
+                        if not self.warp_ready:
+                            print("⚠️ 还未进行M键对齐，无法导出变形模型")
+                        elif detection_result is None or not detection_result.face_landmarks:
+                            print("⚠️ 当前帧未检测到人脸，无法导出")
+                        else:
+                            print("⚠️ 变形功能未就绪，无法导出")
                 elif key == ord('H') or key == ord('h'):  # 'H' 或 'h' 键切换landmarks显示
                     self.show_landmarks = not self.show_landmarks
                     if self.show_landmarks:
@@ -1188,47 +1220,328 @@ class FaceLandmarkerCamera:
 
     def estimate_transform(self, avg_landmarks):
         """
-        使用非刚性拉伸方案：将自定义模型对齐到活人脸，计算形状差异
+        使用自动化精确对齐流程：
+        1. 保存平均landmarks到CSV
+        2. 自动转换为OBJ文件  
+        3. 自动精确对齐到canonical标准
+        4. 计算与Andy_Wah_facemesh.obj的差异
         """
-        if self.custom_vertices is None:
-            print("自定义模型未加载，无法计算变换")
-            return
-        
-        print("开始计算自定义模型到活人脸的变换...")
+        print("开始自动化精确对齐流程...")
         print(f"视频分辨率: {self.camera_width}x{self.camera_height}")
         print(f"视频宽高比: {self.aspect_ratio:.3f}")
         print(f"X坐标修正系数: {self.x_scale_factor:.3f}")
         
-        # 修正平均landmarks的x坐标以适应宽高比
-        corrected_landmarks = avg_landmarks.copy()
-        corrected_landmarks[:, 0] *= self.x_scale_factor  # 只修正x坐标
-        print(f"X坐标修正前范围: [{avg_landmarks[:, 0].min():.4f}, {avg_landmarks[:, 0].max():.4f}]")
-        print(f"X坐标修正后范围: [{corrected_landmarks[:, 0].min():.4f}, {corrected_landmarks[:, 0].max():.4f}]")
+        # 步骤1：保存平均landmarks到CSV文件
+        print("\n=== 步骤1：保存平均landmarks ===")
+        csv_timestamp = int(time.time())
+        csv_filename = f'averaged_landmarks_{csv_timestamp}.csv'
+        csv_filepath = self.save_averaged_landmarks_to_csv(avg_landmarks, csv_filename)
+        if not csv_filepath:
+            print("❌ 保存CSV文件失败")
+            return
+        print(f"✅ CSV文件已保存: {csv_filepath}")
         
-        # 计算从自定义模型到活人脸的相似变换
-        R, s, t = self.compute_similarity_transform(self.custom_vertices, corrected_landmarks)
+        # 步骤2：自动转换CSV为OBJ文件
+        print("\n=== 步骤2：转换CSV为OBJ ===")
+        obj_filepath = self.auto_convert_csv_to_obj(csv_filepath)
+        if not obj_filepath:
+            print("❌ CSV转OBJ失败")
+            return
+        print(f"✅ OBJ文件已生成: {obj_filepath}")
         
-        # 将自定义模型变换到活人脸坐标系
-        custom_in_live = (s * (R @ self.custom_vertices.T).T) + t
+        # 步骤3：自动精确对齐OBJ文件
+        print("\n=== 步骤3：精确对齐到canonical标准 ===")
+        aligned_obj_filepath = self.auto_precise_alignment(obj_filepath)
+        if not aligned_obj_filepath:
+            print("❌ 精确对齐失败")
+            return
+        print(f"✅ 对齐后OBJ文件: {aligned_obj_filepath}")
         
-        # 计算形状差异向量：变换后的自定义模型 - 修正后的活人脸平均位置
-        self.diff_transformed = custom_in_live - corrected_landmarks
+        # 步骤4：计算与目标模型的差异
+        print("\n=== 步骤4：计算形状差异 ===")
+        if self.custom_vertices is None:
+            print("❌ 目标模型(Andy_Wah_facemesh.obj)未加载")
+            return
+            
+        success = self.compute_shape_difference(aligned_obj_filepath)
+        if not success:
+            print("❌ 计算形状差异失败")
+            return
+            
+        print("✅ 自动化精确对齐流程完成！")
+        print("实时变形功能已启用，可以按X键切换显示效果")
+    
+    def save_averaged_landmarks_to_csv(self, avg_landmarks, filename=None):
+        """保存平均landmarks到CSV文件，返回文件路径"""
+        # 确保csv_files文件夹存在
+        csv_dir = "csv_files"
+        if not os.path.exists(csv_dir):
+            os.makedirs(csv_dir)
+            print(f"创建CSV文件夹: {csv_dir}")
         
-        # 将差异的x坐标还原到原始坐标系
-        self.diff_transformed[:, 0] /= self.x_scale_factor
-        self.warp_ready = True
+        # 生成文件路径
+        if filename is None:
+            timestamp = int(time.time())
+            filename = f'averaged_landmarks_{timestamp}.csv'
+        filepath = os.path.join(csv_dir, filename)
         
-        # 保存变换参数到文件
         try:
-            np.save(self.transform_file, self.diff_transformed)
-            print(f"变换参数已保存到: {self.transform_file}")
+            with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['point_id', 'x', 'y', 'z']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                # 写入表头
+                writer.writeheader()
+                
+                # 写入平均landmarks数据
+                for point_id, landmark in enumerate(avg_landmarks):
+                    writer.writerow({
+                        'point_id': point_id,
+                        'x': landmark[0],
+                        'y': landmark[1], 
+                        'z': landmark[2]
+                    })
+                
+            print(f"平均Landmarks已保存: {len(avg_landmarks)} 个点")
+            return filepath
+            
         except Exception as e:
-            print(f"保存变换参数失败: {e}")
-        
-        print("已计算自定义模型形状差异，实时变形已启用")
-        print(f"形状差异范围: X=[{self.diff_transformed[:, 0].min():.4f}, {self.diff_transformed[:, 0].max():.4f}]")
-        print(f"              Y=[{self.diff_transformed[:, 1].min():.4f}, {self.diff_transformed[:, 1].max():.4f}]")
-        print(f"              Z=[{self.diff_transformed[:, 2].min():.4f}, {self.diff_transformed[:, 2].max():.4f}]")
+            print(f"保存平均landmarks失败: {e}")
+            return None
+    
+    def auto_convert_csv_to_obj(self, csv_filepath):
+        """自动将CSV文件转换为OBJ文件"""
+        try:
+            # 导入转换器模块
+            import importlib.util
+            
+            # 动态加载csv_to_obj_converter模块
+            spec = importlib.util.spec_from_file_location("csv_to_obj_converter", "csv_to_obj_converter.py")
+            converter_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(converter_module)
+            
+            # 创建转换器实例
+            converter = converter_module.LandmarksToObjConverter()
+            
+            # 生成输出文件名
+            base_name = os.path.splitext(os.path.basename(csv_filepath))[0]
+            output_obj_name = f"{base_name}_face_model.obj"
+            
+            # 执行转换
+            success = converter.convert(csv_filepath, output_obj_name)
+            
+            if success:
+                # 转换器会自动把文件放在result_file文件夹中
+                result_filepath = os.path.join("result_file", output_obj_name)
+                if os.path.exists(result_filepath):
+                    return result_filepath
+                else:
+                    print(f"转换后的文件未找到: {result_filepath}")
+                    return None
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"自动CSV转OBJ失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def auto_precise_alignment(self, obj_filepath):
+        """自动对OBJ文件进行精确对齐"""
+        try:
+            # 动态加载precise_alignment_tool模块
+            import importlib.util
+            
+            spec = importlib.util.spec_from_file_location("precise_alignment_tool", "precise_alignment_tool.py")
+            alignment_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(alignment_module)
+            
+            # 创建对齐工具实例
+            alignment_tool = alignment_module.PreciseFaceAlignmentTool()
+            
+            # 执行对齐
+            aligned_filepath = alignment_tool.process_model(obj_filepath)
+            
+            if aligned_filepath and os.path.exists(aligned_filepath):
+                return aligned_filepath
+            else:
+                print(f"对齐后的文件未找到: {aligned_filepath}")
+                return None
+                
+        except Exception as e:
+            print(f"自动精确对齐失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def compute_shape_difference(self, aligned_obj_filepath):
+        """计算对齐后的活人脸模型与目标模型的形状差异"""
+        try:
+            # 加载对齐后的活人脸模型
+            aligned_vertices = self.load_obj_vertices(aligned_obj_filepath)
+            print(f"对齐后活人脸模型: {len(aligned_vertices)} 个顶点")
+            
+            # 确保顶点数量匹配
+            if len(aligned_vertices) != len(self.custom_vertices):
+                print(f"⚠️ 顶点数量不匹配: 活人脸{len(aligned_vertices)} vs 目标模型{len(self.custom_vertices)}")
+                # 取较小的数量
+                min_count = min(len(aligned_vertices), len(self.custom_vertices))
+                aligned_vertices = aligned_vertices[:min_count]
+                custom_vertices_trimmed = self.custom_vertices[:min_count]
+            else:
+                custom_vertices_trimmed = self.custom_vertices
+            
+            print("=== 坐标系转换 ===")
+            print("OBJ文件使用3D世界坐标系，需要转换为MediaPipe归一化坐标系")
+            
+            # 【关键修复】将3D OBJ坐标转换为MediaPipe归一化坐标
+            # 参考csv_to_obj_converter.py的逆向转换
+            
+            # 转换参数（与csv_to_obj_converter.py中的参数对应）
+            aspect_ratio_correction = 16.0 / 9.0  # ≈ 1.777
+            overall_scale = 55.0
+            
+            def obj_to_normalized(obj_coords):
+                """将OBJ 3D坐标转换为MediaPipe归一化坐标"""
+                normalized = np.zeros_like(obj_coords)
+                
+                # 逆向转换（参考csv_to_obj_converter.py）
+                # OBJ: x_3d = (x - 0.5) * aspect_ratio_correction * overall_scale
+                # 逆向: x = x_3d / (aspect_ratio_correction * overall_scale) + 0.5
+                normalized[:, 0] = obj_coords[:, 0] / (aspect_ratio_correction * overall_scale) + 0.5
+                
+                # OBJ: y_3d = -(y - 0.5) * overall_scale  
+                # 逆向: y = 0.5 - y_3d / overall_scale
+                normalized[:, 1] = 0.5 - obj_coords[:, 1] / overall_scale
+                
+                # OBJ: z_3d = -z * aspect_ratio_correction * overall_scale
+                # 逆向: z = -z_3d / (aspect_ratio_correction * overall_scale)
+                normalized[:, 2] = -obj_coords[:, 2] / (aspect_ratio_correction * overall_scale)
+                
+                return normalized
+            
+            # 转换两个模型到归一化坐标系
+            aligned_normalized = obj_to_normalized(aligned_vertices)
+            target_normalized = obj_to_normalized(custom_vertices_trimmed)
+            
+            print(f"转换后坐标范围检查:")
+            print(f"  对齐模型 X: [{aligned_normalized[:, 0].min():.6f}, {aligned_normalized[:, 0].max():.6f}]")
+            print(f"  对齐模型 Y: [{aligned_normalized[:, 1].min():.6f}, {aligned_normalized[:, 1].max():.6f}]")
+            print(f"  对齐模型 Z: [{aligned_normalized[:, 2].min():.6f}, {aligned_normalized[:, 2].max():.6f}]")
+            print(f"  目标模型 X: [{target_normalized[:, 0].min():.6f}, {target_normalized[:, 0].max():.6f}]")
+            print(f"  目标模型 Y: [{target_normalized[:, 1].min():.6f}, {target_normalized[:, 1].max():.6f}]")
+            print(f"  目标模型 Z: [{target_normalized[:, 2].min():.6f}, {target_normalized[:, 2].max():.6f}]")
+            
+            # 计算形状差异向量：目标模型 - 对齐后的活人脸（都在归一化坐标系中）
+            self.diff_transformed = target_normalized - aligned_normalized
+            
+            self.warp_ready = True
+            
+            # 保存变换参数到文件
+            try:
+                np.save(self.transform_file, self.diff_transformed)
+                print(f"变换参数已保存到: {self.transform_file}")
+            except Exception as e:
+                print(f"保存变换参数失败: {e}")
+            
+            # 分析差异统计
+            diff_stats = {
+                'x_range': (self.diff_transformed[:, 0].min(), self.diff_transformed[:, 0].max()),
+                'y_range': (self.diff_transformed[:, 1].min(), self.diff_transformed[:, 1].max()),
+                'z_range': (self.diff_transformed[:, 2].min(), self.diff_transformed[:, 2].max()),
+                'mean_distance': np.mean(np.linalg.norm(self.diff_transformed, axis=1))
+            }
+            
+            print("归一化坐标系中的形状差异统计:")
+            print(f"  X方向: [{diff_stats['x_range'][0]:.6f}, {diff_stats['x_range'][1]:.6f}]")
+            print(f"  Y方向: [{diff_stats['y_range'][0]:.6f}, {diff_stats['y_range'][1]:.6f}]") 
+            print(f"  Z方向: [{diff_stats['z_range'][0]:.6f}, {diff_stats['z_range'][1]:.6f}]")
+            print(f"  平均差异距离: {diff_stats['mean_distance']:.6f}")
+            
+            if diff_stats['mean_distance'] < 0.1:
+                print("✅ 差异在合理范围内，适合实时变形")
+            elif diff_stats['mean_distance'] < 0.2:
+                print("⚠️ 差异较大，变形效果可能明显")
+            else:
+                print("❌ 差异过大，可能需要调整对齐参数")
+            
+            return True
+            
+        except Exception as e:
+            print(f"计算形状差异失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def export_warped_landmarks_to_obj(self, warped_landmarks, filename=None):
+        """将变形后的landmarks导出为OBJ文件"""
+        try:
+            if filename is None:
+                timestamp = int(time.time())
+                filename = f'warped_face_model_{timestamp}.obj'
+            
+            # 确保保存在result_file文件夹中（而不是output_dir）
+            result_dir = "result_file"
+            os.makedirs(result_dir, exist_ok=True)
+            filepath = os.path.join(result_dir, filename)
+            
+            # 坐标系转换：MediaPipe归一化坐标 -> OBJ 3D坐标
+            # 使用与csv_to_obj_converter.py相同的转换参数
+            aspect_ratio_correction = 16.0 / 9.0  # ≈ 1.777
+            overall_scale = 55.0
+            
+            print(f"\n=== 导出变形后的人脸模型 ===")
+            print(f"将变形后的归一化坐标转换为OBJ 3D坐标")
+            print(f"输出文件: {filepath}")
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                # 写入OBJ文件头部
+                f.write("# 变形后的面部模型\n")
+                f.write(f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"# 基于MediaPipe face landmarks，应用了目标模型形状差异\n")
+                f.write(f"# 总顶点数: {len(warped_landmarks)}\n")
+                f.write("\n")
+                
+                # 转换坐标并写入顶点
+                for i, (x_norm, y_norm, z_norm) in enumerate(warped_landmarks):
+                    # 坐标转换（与csv_to_obj_converter.py保持一致）
+                    x_3d = (x_norm - 0.5) * aspect_ratio_correction * overall_scale
+                    y_3d = -(y_norm - 0.5) * overall_scale  # Y轴翻转
+                    z_3d = -z_norm * aspect_ratio_correction * overall_scale  # Z轴翻转并缩放
+                    
+                    f.write(f"v {x_3d:.6f} {y_3d:.6f} {z_3d:.6f}\n")
+                
+                # 添加面部网格连接信息（可选）
+                f.write("\n# 面部网格连接\n")
+                f.write("# 使用MediaPipe FACEMESH_TESSELATION连接\n")
+                
+                # 如果需要添加面的定义，可以基于MediaPipe的连接信息
+                # 这里暂时只保存顶点，因为主要用于形状分析
+            
+            print(f"✅ 变形后的人脸模型已导出: {filepath}")
+            
+            # 统计变形后的坐标范围
+            coords_3d = []
+            for x_norm, y_norm, z_norm in warped_landmarks:
+                x_3d = (x_norm - 0.5) * aspect_ratio_correction * overall_scale
+                y_3d = -(y_norm - 0.5) * overall_scale
+                z_3d = -z_norm * aspect_ratio_correction * overall_scale
+                coords_3d.append([x_3d, y_3d, z_3d])
+            
+            coords_3d = np.array(coords_3d)
+            print(f"变形后模型3D坐标范围:")
+            print(f"  X: [{coords_3d[:, 0].min():.3f}, {coords_3d[:, 0].max():.3f}]")
+            print(f"  Y: [{coords_3d[:, 1].min():.3f}, {coords_3d[:, 1].max():.3f}]")
+            print(f"  Z: [{coords_3d[:, 2].min():.3f}, {coords_3d[:, 2].max():.3f}]")
+            
+            return filepath
+            
+        except Exception as e:
+            print(f"导出变形后模型失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def load_chinese_font(self):
         """加载中文字体用于GUI显示"""
