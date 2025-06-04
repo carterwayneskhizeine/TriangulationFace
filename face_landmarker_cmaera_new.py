@@ -58,7 +58,8 @@ class FaceLandmarkerCamera:
         self.N = 60
         self.warp_ready = False
         self.diff_transformed = None
-        self.transform_file = "face_transform.npy"  # 保存变换参数的文件
+        # 变换参数文件路径修改为 npy 文件夹
+        self.transform_file = os.path.join("npy", "face_transform.npy")  # 保存变换参数的文件
         
         # 加载中文字体用于GUI显示
         self.chinese_font = self.load_chinese_font()
@@ -1162,7 +1163,8 @@ class FaceLandmarkerCamera:
     def estimate_transform(self, avg_landmarks):
         """
         利用非刚性 CPD 把自定义模型顶点对齐到活人脸，
-        生成 per-vertex 形变差异 self.diff_transformed
+        生成 per-vertex 形变差异 self.diff_transformed，
+        并保持面部大小与原始landmarks一致
         """
         if self.custom_vertices is None:
             print("自定义模型未加载，无法计算变换")
@@ -1180,20 +1182,46 @@ class FaceLandmarkerCamera:
         reg = DeformableRegistration(X=src_coarse, Y=tgt,
                                     beta=2.0,       # 高斯核尺度，越小→越局部
                                     lamb=3.0)       # 正则，越大→越平滑
-        TY, _ = reg.register()                       # TY = 形变后的自定义模型
+        TY, _ = reg.register()                      # TY = 形变后的自定义模型
+        
+        # ---- 3. 应用缩放修正，保持面部大小 ----
+        # 获取变形前后的面部尺寸
+        tgt_width = np.max(tgt[:, 0]) - np.min(tgt[:, 0])
+        tgt_height = np.max(tgt[:, 1]) - np.min(tgt[:, 1])
+        
+        ty_width = np.max(TY[:, 0]) - np.min(TY[:, 0])
+        ty_height = np.max(TY[:, 1]) - np.min(TY[:, 1])
+        
+        # 计算尺寸比例
+        width_ratio = tgt_width / ty_width if ty_width > 0 else 1.0
+        height_ratio = tgt_height / ty_height if ty_height > 0 else 1.0
+        
+        # 选择一个合适的缩放因子（可以取平均值或者最大值）
+        scale_factor = max(width_ratio, height_ratio)
+        
+        # 获取中心点
+        ty_center = np.mean(TY, axis=0)
+        
+        # 对变形结果应用缩放修正，保持中心点不变
+        TY_scaled = ty_center + (TY - ty_center) * scale_factor
+        
+        print(f"应用缩放修正: {scale_factor:.2f}倍")
 
-        # ---- 3. 形状差异向量（回到原始 16:9 坐标系） ----
-        diff = TY - tgt
+        # ---- 4. 形状差异向量（回到原始 16:9 坐标系） ----
+        diff = TY_scaled - tgt
         diff[:, 0] /= self.x_scale_factor           # 把 x 还原
         self.diff_transformed = diff
         self.warp_ready = True
 
-        # ---- 4. 持久化 ----
+        # ---- 5. 持久化 ----
         np.save(self.transform_file, self.diff_transformed)
         print(f"非刚性变换完成，已保存到 {self.transform_file}")
         print(f"差异范围: ΔX[{diff[:,0].min():.4f},{diff[:,0].max():.4f}] "
-            f"ΔY[{diff[:,1].min():.4f},{diff[:,1].max():.4f}] "
-            f"ΔZ[{diff[:,2].min():.4f},{diff[:,2].max():.4f}]")
+              f"ΔY[{diff[:,1].min():.4f},{diff[:,1].max():.4f}] "
+              f"ΔZ[{diff[:,2].min():.4f},{diff[:,2].max():.4f}]")
+        print(f"变形前尺寸: 宽={tgt_width:.4f}, 高={tgt_height:.4f}")
+        print(f"变形后尺寸: 宽={ty_width:.4f}, 高={ty_height:.4f}")
+        print(f"修正后尺寸: 宽={ty_width*scale_factor:.4f}, 高={ty_height*scale_factor:.4f}")
 
 
     def load_chinese_font(self):
