@@ -382,92 +382,65 @@ class FaceLandmarkerCamera:
     
     def apply_perspective_warp_to_landmarks(self, src_landmarks, dst_landmarks):
         """
-        对landmarks应用真正的透视投影变形
-        修正之前的数学错误，实现有效的透视效果
-        
-        Args:
-            src_landmarks: 原始landmarks坐标，可以为None
-            dst_landmarks: 目标landmarks坐标，将应用透视变换
-            
-        Returns:
-            应用透视变换后的landmarks坐标
+        对landmarks应用真正的透视投影变形。
+        此函数将MediaPipe的归一化正交视图landmarks，通过以下步骤转换为透视视图landmarks：
+        1. 还原：将归一化坐标和相对深度(z)还原为相机坐标系下的3D点云。
+        2. 投影：使用针孔相机模型将3D点云重新投影回2D屏幕。
+        3. 格式化：将投影后的2D点重新转换为MediaPipe的归一化坐标格式。
         """
         try:
             if not self.enable_perspective_projection:
                 return dst_landmarks.copy()
 
-            # 获取相机参数
-            fx = self.camera_fx if self.camera_fx is not None else min(self.camera_width, self.camera_height) * 0.8
-            fy = self.camera_fy if self.camera_fy is not None else fx
-            
-            # 【关键改动】使用相机主点作为透视中心，以实现物理上正确的透视投影。
-            # 这种方法更符合真实世界相机的成像原理。
-            # 用户仍然可以通过J/L/I/K键进行微调。
-            perspective_cx = self.camera_cx + self.perspective_center_offset_x
-            perspective_cy = self.camera_cy + self.perspective_center_offset_y
-            
-            # 每100帧打印一次透视中心信息
-            if hasattr(self, '_debug_frame_count') and self._debug_frame_count % 100 == 0:
-                print(f"透视中心: ({perspective_cx:.1f}, {perspective_cy:.1f}) (基于相机主点)")
-
-            projected_dst = dst_landmarks.copy()
-
-            # 【调试信息】分析MediaPipe z值分布
-            z_values = [lm[2] for lm in dst_landmarks]
-            z_min, z_max, z_mean = min(z_values), max(z_values), np.mean(z_values)
-            z_std = np.std(z_values)
-            
-            # 每100帧打印一次调试信息
-            if hasattr(self, '_debug_frame_count'):
-                self._debug_frame_count += 1
-            else:
-                self._debug_frame_count = 0
-                
-            if self._debug_frame_count % 100 == 0:
-                print(f"MediaPipe Z值分析: min={z_min:.4f}, max={z_max:.4f}, mean={z_mean:.4f}, std={z_std:.4f}")
-
-            # 【改进算法】更直观的透视控制
-            # 如果depth_variation为0，返回正交投影（无透视变化）
+            # 如果深度变化为0，相当于正交投影，直接返回
             if abs(self.perspective_depth_variation) < 1e-6:
                 return dst_landmarks.copy()
+
+            # 获取相机内参，如果未校准则使用估计值
+            fx = self.camera_fx if self.camera_fx is not None else self.camera_width
+            fy = self.camera_fy if self.camera_fy is not None else self.camera_width
+            # 获取相机主点，并应用手动偏移作为透视中心
+            cx = (self.camera_cx if self.camera_cx is not None else self.camera_width / 2) + self.perspective_center_offset_x
+            cy = (self.camera_cy if self.camera_cy is not None else self.camera_height / 2) + self.perspective_center_offset_y
+
+            projected_dst = dst_landmarks.copy()
+            z_values = dst_landmarks[:, 2]
+            z_mean = np.mean(z_values)
+
+            # --- 步骤1: 还原 - 将正交视图点转换为3D空间点 ---
+            # MediaPipe的输出可以看作是"压平"在某个参考平面上的正交投影。
+            # 我们首先假设所有点都在一个z=standard_depth的平面上，并计算出它们对应的3D坐标。
+            standard_depth = self.perspective_base_depth
             
-            for i in range(len(dst_landmarks)):
-                xn, yn, zn = dst_landmarks[i]
+            # 将归一化坐标转换为像素坐标
+            x_pixels = dst_landmarks[:, 0] * self.camera_width
+            y_pixels = dst_landmarks[:, 1] * self.camera_height
+            
+            # 使用针孔相机模型的逆运算，计算出在standard_depth平面上的3D坐标
+            # X = (x_pixel - cx) * Z / fx
+            cam_X_on_plane = (x_pixels - cx) * standard_depth / fx
+            cam_Y_on_plane = (y_pixels - cy) * standard_depth / fy
 
-                # 1. 将归一化坐标转换为像素坐标
-                x_pixel = xn * self.camera_width
-                y_pixel = yn * self.camera_height
-
-                # 2. 使用人脸中心作为透视中心，计算相对于人脸中心的3D坐标
-                standard_depth = self.perspective_base_depth
-                cam_X = (x_pixel - perspective_cx) * standard_depth / fx
-                cam_Y = (y_pixel - perspective_cy) * standard_depth / fy
-
-                # 3. 【改进】更灵活的深度调整策略
-                # 将MediaPipe的z值映射到深度变化
-                # zn通常在[-0.1, 0.1]范围内，我们需要将其放大到有意义的深度变化
-                
-                # 计算相对于z均值的偏差
-                z_offset = zn - z_mean
-                
-                # 应用深度变化（支持正负值）
-                # 正值：z值大的点更远，z值小的点更近（常规透视）
-                # 负值：z值大的点更近，z值小的点更远（反向透视）
-                depth_change = z_offset * self.perspective_depth_variation
-                actual_depth = standard_depth + depth_change
-                
-                # 确保深度为正值
-                if actual_depth <= 0.1:
-                    actual_depth = 0.1
-
-                # 4. 用新的深度重新投影到2D，仍然以人脸中心为透视中心
-                new_x_pixel = fx * cam_X / actual_depth + perspective_cx
-                new_y_pixel = fy * cam_Y / actual_depth + perspective_cy
-
-                # 5. 转换回归一化坐标
-                projected_dst[i, 0] = new_x_pixel / self.camera_width
-                projected_dst[i, 1] = new_y_pixel / self.camera_height
-                projected_dst[i, 2] = zn  # 保持原始z值用于其他处理
+            # --- 步骤2: 投影 - 应用真实深度并重新投影 ---
+            # 现在，我们根据每个点的MediaPipe z值，计算其真实的、变化的深度。
+            z_offsets = z_values - z_mean
+            depth_changes = z_offsets * self.perspective_depth_variation
+            actual_depths = standard_depth + depth_changes
+            
+            # 确保深度为正值，避免投影到相机后方
+            actual_depths[actual_depths < 0.1] = 0.1
+            
+            # 关键步骤：用新的深度(actual_depths)重新投影这些3D点。
+            # 这个过程等效于将点从参考平面移动到它们的真实深度位置，并观察其在屏幕上的新位置。
+            # new_x_pixel = fx * X_on_plane / actual_depth + cx
+            new_x_pixels = fx * cam_X_on_plane / actual_depths + cx
+            new_y_pixels = fy * cam_Y_on_plane / actual_depths + cy
+            
+            # --- 步骤3: 格式化 - 转换回MediaPipe的归一化格式 ---
+            projected_dst[:, 0] = new_x_pixels / self.camera_width
+            projected_dst[:, 1] = new_y_pixels / self.camera_height
+            # 保持原始z值不变，因为后续管线或调试可能需要
+            projected_dst[:, 2] = dst_landmarks[:, 2] 
 
             return projected_dst
             
@@ -713,7 +686,7 @@ class FaceLandmarkerCamera:
             image = self.put_chinese_text(image, center_text, 
                                         (10, height - 215), font_size=18, color=(128, 255, 255))
         else:
-            image = self.put_chinese_text(image, '透视中心: 基于相机主点 (J/L/I/K调节)', 
+            image = self.put_chinese_text(image, '透视中心: 基于人脸中心 (J/L/I/K调节)', 
                                         (10, height - 215), font_size=18, color=(128, 128, 128))
         
         # 显示landmarks缩放状态
