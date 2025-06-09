@@ -400,18 +400,15 @@ class FaceLandmarkerCamera:
             fx = self.camera_fx if self.camera_fx is not None else min(self.camera_width, self.camera_height) * 0.8
             fy = self.camera_fy if self.camera_fy is not None else fx
             
-            # 【关键修复】使用人脸中心作为透视中心，而不是相机主点
-            # 计算人脸landmarks的中心点（像素坐标）
-            face_center_x = np.mean([lm[0] for lm in dst_landmarks]) * self.camera_width
-            face_center_y = np.mean([lm[1] for lm in dst_landmarks]) * self.camera_height
-            
-            # 使用人脸中心作为透视中心，并应用手动偏移
-            perspective_cx = face_center_x + self.perspective_center_offset_x
-            perspective_cy = face_center_y + self.perspective_center_offset_y
+            # 【关键改动】使用相机主点作为透视中心，以实现物理上正确的透视投影。
+            # 这种方法更符合真实世界相机的成像原理。
+            # 用户仍然可以通过J/L/I/K键进行微调。
+            perspective_cx = self.camera_cx + self.perspective_center_offset_x
+            perspective_cy = self.camera_cy + self.perspective_center_offset_y
             
             # 每100帧打印一次透视中心信息
             if hasattr(self, '_debug_frame_count') and self._debug_frame_count % 100 == 0:
-                print(f"透视中心: ({perspective_cx:.1f}, {perspective_cy:.1f}), 画面中心: ({self.camera_width/2:.1f}, {self.camera_height/2:.1f})")
+                print(f"透视中心: ({perspective_cx:.1f}, {perspective_cy:.1f}) (基于相机主点)")
 
             projected_dst = dst_landmarks.copy()
 
@@ -716,7 +713,7 @@ class FaceLandmarkerCamera:
             image = self.put_chinese_text(image, center_text, 
                                         (10, height - 215), font_size=18, color=(128, 255, 255))
         else:
-            image = self.put_chinese_text(image, '透视中心: 基于人脸中心 (J/L/I/K调节)', 
+            image = self.put_chinese_text(image, '透视中心: 基于相机主点 (J/L/I/K调节)', 
                                         (10, height - 215), font_size=18, color=(128, 128, 128))
         
         # 显示landmarks缩放状态

@@ -3,3 +3,6 @@ __pycache__
 npy
 csv_files
 result_file
+facelandmarker_full_log.txt
+test.py
+output_path
